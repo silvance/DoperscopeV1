@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+*.swp
+.venv/
+venv/
+
+# Local capture / logs
+doperscope.db
+doperscope.db-journal
+*.pcap
+*.log

@@ -16,5 +16,5 @@ sleep 10
 /usr/sbin/iw dev wlan1 set channel 6
 
 # 5. Launch with unbuffered output (-u) so we can see errors
-cd /home/silvance/dopescope
+cd "$(dirname "$(readlink -f "$0")")"
 /usr/bin/python3 -u main.py
