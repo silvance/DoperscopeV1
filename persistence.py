@@ -120,6 +120,31 @@ class Persistence:
             pass
         return alerts
 
+    def get_recent_alerts(self, limit=50):
+        """Read the most recent alerts from disk for the Log tab. Opens a
+        fresh read-only connection so it's safe to call from the UI thread."""
+        try:
+            conn = sqlite3.connect(self._db_path)
+            try:
+                rows = conn.execute(
+                    """SELECT ts, kind, fingerprint, mac, ssid, os, dev_type, rssi
+                       FROM phone_alerts
+                       ORDER BY ts DESC
+                       LIMIT ?""",
+                    (limit,),
+                ).fetchall()
+            finally:
+                conn.close()
+        except Exception:
+            return []
+        return [
+            {
+                "ts": r[0], "kind": r[1], "fingerprint": r[2], "mac": r[3],
+                "ssid": r[4], "os": r[5], "dev_type": r[6], "rssi": r[7],
+            }
+            for r in rows
+        ]
+
     def _loop(self):
         conn = sqlite3.connect(self._db_path)
         try:

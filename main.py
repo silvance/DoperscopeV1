@@ -46,7 +46,7 @@ LOCKED_COL = (255, 200,   0)
 
 WIFI_FILTERS = ["ALL", "2.4G", "5G"]
 SORTS        = ["rssi", "ssid", "channel"]
-TABS         = ["WiFi", "BLE", "Phones", "Zigbee"]
+TABS         = ["WiFi", "BLE", "Phones", "Zigbee", "Log"]
 
 # DF mode history length
 DF_HISTORY = 60
@@ -152,6 +152,17 @@ class Doperscope:
         self.ble_df_last    = -100
         self.ble_df_trend   = "STEADY"
         self.ble_df_missing = False
+
+        # Phone DF state — tracks by IE fingerprint so MAC rotation doesn't
+        # break the lock during a sweep.
+        self.phone_df_target  = None
+        self.phone_df_history = collections.deque(maxlen=DF_HISTORY)
+        self.phone_df_peak    = -100
+        self.phone_df_avg     = -100
+        self.phone_df_last    = -100
+        self.phone_df_trend   = "STEADY"
+        self.phone_df_missing = False
+
         self.ROWS_VISIBLE = 5
         self.ROW_H        = 70
 
@@ -202,6 +213,8 @@ class Doperscope:
             items = self.scanner.get_probes(phones_only=True)
         elif self.tab == 3:
             items = self.zigbee.get_devices()
+        elif self.tab == 4:
+            items = self.persistence.get_recent_alerts()
         else:
             items = self._get_wifi_devices()
         self.selected = min(max(len(items) - 1, 0), self.selected + 1)
@@ -243,16 +256,29 @@ class Doperscope:
                 self.ble_df_last    = -100
                 self.ble_df_trend   = "STEADY"
                 self.ble_df_missing = False
-        elif self.view in ("client_list", "df_mode", "ble_df_mode"):
+        elif self.view == "ap_list" and self.tab == 2:
+            # Phone DF mode — fingerprint-locked.
+            probes = self.scanner.get_probes(phones_only=True)
+            if probes and 0 <= self.selected < len(probes):
+                self.phone_df_target  = probes[self.selected]
+                self.view             = "phone_df_mode"
+                self.phone_df_history.clear()
+                self.phone_df_peak    = -100
+                self.phone_df_avg     = -100
+                self.phone_df_last    = -100
+                self.phone_df_trend   = "STEADY"
+                self.phone_df_missing = False
+        elif self.view in ("client_list", "df_mode", "ble_df_mode", "phone_df_mode"):
             self.view     = "ap_list"
             self.selected = 0
             self.scroll   = 0
             self.locked   = None
+            self.phone_df_target = None
             self.scanner.locked_channel = None
 
     def _action_y(self):
         # Y (shoulder): switch tabs
-        if self.view in ("client_list", "df_mode"):
+        if self.view in ("client_list", "df_mode", "phone_df_mode"):
             return
         self.tab      = (self.tab + 1) % len(TABS)
         self.selected = 0
@@ -268,6 +294,10 @@ class Doperscope:
             self.ble_df_peak = self.ble_df_last
             self.ble_df_history.clear()
             self.ble_df_missing = False
+        elif self.view == "phone_df_mode":
+            self.phone_df_peak = self.phone_df_last
+            self.phone_df_history.clear()
+            self.phone_df_missing = False
         else:
             self.locked   = None
             self.view     = "ap_list"
@@ -275,12 +305,13 @@ class Doperscope:
             self.scroll   = 0
 
     def _action_joy(self):
-        if self.view in ("client_list", "df_mode", "ble_df_mode"):
+        if self.view in ("client_list", "df_mode", "ble_df_mode", "phone_df_mode"):
             self.view     = "ap_list"
             self.selected = 0
             self.scroll   = 0
             self.locked   = None
-            self.ble_df_target = None
+            self.ble_df_target   = None
+            self.phone_df_target = None
 
     def _cycle_sort(self):
         self.sort_idx = (self.sort_idx + 1) % len(SORTS)
@@ -397,6 +428,52 @@ class Doperscope:
                 else:
                     self.ble_df_trend = "STEADY ●"
 
+    def _update_phone_df(self):
+        """Read live RSSI for the locked probe fingerprint. The fingerprint
+        is the primary key — MAC rotation just produces a new alias on the
+        same tracked probe, so we keep the lock through randomization."""
+        if not self.phone_df_target:
+            return
+
+        target_fp = self.phone_df_target.get("fingerprint")
+        if not target_fp:
+            self.phone_df_missing = True
+            return
+
+        # All probes (not phones_only) so a watchlist-only target also tracks.
+        probes = self.scanner.get_probes()
+        live   = next((p for p in probes if p.get("fingerprint") == target_fp), None)
+
+        if not live:
+            self.phone_df_missing = True
+            return
+
+        self.phone_df_missing = False
+        # Surface the latest MAC alias on the target so the UI shows rotation.
+        self.phone_df_target["mac"]  = live["mac"]
+        self.phone_df_target["macs"] = live.get("macs", [live["mac"]])
+
+        rssi = live["rssi"]
+        self.phone_df_history.append(rssi)
+        self.phone_df_last = rssi
+        if rssi > self.phone_df_peak:
+            self.phone_df_peak = rssi
+
+        if len(self.phone_df_history) >= 3:
+            self.phone_df_avg = int(sum(self.phone_df_history) / len(self.phone_df_history))
+            recent = list(self.phone_df_history)[-6:]
+            older  = list(self.phone_df_history)[-12:-6]
+            if older:
+                recent_avg = sum(recent) / len(recent)
+                older_avg  = sum(older)  / len(older)
+                diff = recent_avg - older_avg
+                if diff > 2:
+                    self.phone_df_trend = "STRONGER ▲"
+                elif diff < -2:
+                    self.phone_df_trend = "WEAKER ▼"
+                else:
+                    self.phone_df_trend = "STEADY ●"
+
     def _play_geiger_tick(self, rssi):
         if not self.tick_sound:
             return
@@ -422,7 +499,12 @@ class Doperscope:
         # Auto-shrink tab width as tabs are added so right_text in the
         # topbar still has room.
         n     = len(TABS)
-        tab_w = 90 if n >= 4 else 120
+        if n >= 5:
+            tab_w = 72
+        elif n >= 4:
+            tab_w = 90
+        else:
+            tab_w = 120
         tab_h = 36
         for i, label in enumerate(TABS):
             x      = 10 + i * (tab_w + 8)
@@ -843,7 +925,129 @@ class Doperscope:
                     (graph_x + graph_w - 30, gy - 10)
                 )
 
-        self._draw_footer("Y:Back  A:Reset Peak  Start:Back")# ── BLE list ─────────────────────────────────────────
+        self._draw_footer("Y:Back  A:Reset Peak  Start:Back")
+
+    # ── Phone DF Mode ────────────────────────────────────
+
+    def _draw_phone_df_mode(self):
+        self._update_phone_df()
+        target = self.phone_df_target
+        rssi   = self.phone_df_last
+        color  = rssi_color(rssi)
+        watch  = bool(target.get("is_watchlisted"))
+
+        # Header
+        pygame.draw.rect(self.screen, BG_HEADER, (0, 0, 640, 44))
+        title_col = LOCKED_COL if watch else RED
+        title     = f"PHONE DF: {target.get('os','?')} {target.get('dev_type','?')[:18]}"
+        self.screen.blit(self.font_title.render(title[:42], True, title_col), (12, 8))
+
+        # MAC line — show rotation count and seeking SSID.
+        pygame.draw.rect(self.screen, (25, 20, 10), (0, 44, 640, 24))
+        mac_count = len(target.get("macs", [target.get("mac", "?")]))
+        rotate    = f"  [{mac_count}x MAC]" if mac_count > 1 else ""
+        seeking   = target.get("ssid", "<broadcast>")
+        if watch and target.get("matched_ssids"):
+            seeking = target["matched_ssids"][0]
+        self.screen.blit(
+            self.font_small.render(
+                f"{target.get('mac','?')}{rotate}  seeking:{seeking[:24]}",
+                True, GREY
+            ), (12, 50)
+        )
+        if watch:
+            self.screen.blit(
+                self.font_small.render("⚠ WATCHLIST", True, LOCKED_COL),
+                (530, 50)
+            )
+
+        # Missing warning — phones may stop probing for 30+ seconds.
+        if self.phone_df_missing:
+            pygame.draw.rect(self.screen, (60, 10, 10), (0, 68, 640, 36))
+            self.screen.blit(
+                self.font_main.render(
+                    "⚠ TARGET QUIET — phone may have stopped probing", True, RED
+                ), (12, 76)
+            )
+            y_offset = 108
+        else:
+            y_offset = 68
+
+        # Big RSSI
+        rssi_str  = f"{rssi} dBm"
+        rssi_surf = self.font_huge.render(rssi_str, True, color)
+        self.screen.blit(rssi_surf, (320 - rssi_surf.get_width() // 2, y_offset))
+
+        # Bar
+        bar_x, bar_h, bar_max_w = 20, 36, 600
+        bar_y = y_offset + 100
+        bar_w = rssi_bar_width(rssi, max_width=bar_max_w)
+        pygame.draw.rect(self.screen, (40, 40, 40), (bar_x, bar_y, bar_max_w, bar_h))
+        pygame.draw.rect(self.screen, color, (bar_x, bar_y, bar_w, bar_h))
+        for dbm, label in [(-80, "-80"), (-65, "-65"), (-50, "-50"), (-35, "-35")]:
+            mx = bar_x + rssi_bar_width(dbm, max_width=bar_max_w)
+            pygame.draw.line(self.screen, GREY, (mx, bar_y), (mx, bar_y + bar_h), 1)
+            self.screen.blit(
+                self.font_small.render(label, True, GREY),
+                (mx - 10, bar_y + bar_h + 4)
+            )
+
+        # Peak / avg / trend
+        stats_y = bar_y + bar_h + 24
+        pygame.draw.rect(self.screen, (18, 18, 48), (0, stats_y, 640, 36))
+        self.screen.blit(
+            self.font_main.render(f"PEAK: {self.phone_df_peak} dBm", True, GREEN),
+            (20, stats_y + 6)
+        )
+        self.screen.blit(
+            self.font_main.render(f"AVG: {self.phone_df_avg} dBm", True, YELLOW),
+            (220, stats_y + 6)
+        )
+        trend_col = GREEN if "STRONGER" in self.phone_df_trend else RED if "WEAKER" in self.phone_df_trend else GREY
+        self.screen.blit(
+            self.font_main.render(self.phone_df_trend, True, trend_col),
+            (430, stats_y + 6)
+        )
+
+        # History graph
+        graph_x, graph_y = 20, stats_y + 44
+        graph_w = 600
+        graph_h = 480 - graph_y - 44
+        if graph_h > 20:
+            pygame.draw.rect(self.screen, (18, 18, 40), (graph_x, graph_y, graph_w, graph_h))
+            pygame.draw.rect(self.screen, (40, 40, 60), (graph_x, graph_y, graph_w, graph_h), 1)
+            self.screen.blit(
+                self.font_small.render("Signal History", True, GREY),
+                (graph_x + 4, graph_y + 4)
+            )
+            history = list(self.phone_df_history)
+            if len(history) > 1:
+                step   = graph_w / DF_HISTORY
+                points = []
+                for i, val in enumerate(history):
+                    px   = int(graph_x + i * step)
+                    norm = (val + 100) / 80
+                    py   = int(graph_y + graph_h - norm * graph_h)
+                    py   = max(graph_y + 2, min(graph_y + graph_h - 2, py))
+                    points.append((px, py))
+                if len(points) > 1:
+                    pygame.draw.lines(self.screen, color, False, points, 2)
+            for dbm, label in [(-80, "-80"), (-65, "-65"), (-50, "-50")]:
+                norm = (dbm + 100) / 80
+                gy   = int(graph_y + graph_h - norm * graph_h)
+                pygame.draw.line(
+                    self.screen, (40, 40, 60),
+                    (graph_x, gy), (graph_x + graph_w, gy), 1
+                )
+                self.screen.blit(
+                    self.font_small.render(label, True, (50, 50, 70)),
+                    (graph_x + graph_w - 30, gy - 10)
+                )
+
+        self._draw_footer("Joy/Start:Back  A:Reset Peak")
+        self._play_geiger_tick(rssi)
+
+    # ── BLE list ─────────────────────────────────────────
 
     def _draw_ble_list(self):
         sort_key = "name" if SORTS[self.sort_idx] == "ssid" else "rssi"
@@ -994,7 +1198,7 @@ class Doperscope:
                 )
                 draw_signal_bars(self.screen, 580, y + 8, pr["rssi"], height=30)
 
-        self._draw_footer("up/dn:Scroll  Y:Tab  Edit ssid_watchlist.txt to tune")
+        self._draw_footer("up/dn:Scroll  B:DF  Y:Tab  Edit ssid_watchlist.txt to tune")
 
     # ── Zigbee tab ───────────────────────────────────────
 
@@ -1084,6 +1288,93 @@ class Doperscope:
 
         self._draw_footer("Y:Tab")
 
+    # ── Alert log tab ────────────────────────────────────
+
+    def _draw_log_list(self):
+        alerts = self.persistence.get_recent_alerts(limit=200)
+        n = len(alerts)
+        self._draw_topbar(right_text=f"{n} alerts")
+
+        pygame.draw.rect(self.screen, (40, 8, 8), (0, 44, 640, 22))
+        self.screen.blit(
+            self.font_small.render(
+                "Persistent phone-alert history (most recent first)", True, ORANGE
+            ), (8, 48)
+        )
+
+        ROW_H   = 50
+        VISIBLE = 7
+
+        if not alerts:
+            self.screen.blit(
+                self.font_main.render("No alerts logged yet.", True, GREY),
+                (190, 240)
+            )
+            self.screen.blit(
+                self.font_small.render(
+                    "Alerts land here when a phone or watchlist SSID is first seen.",
+                    True, (90, 90, 110)
+                ),
+                (60, 274)
+            )
+            self._draw_footer("Y:Tab")
+            return
+
+        # Clamp selection to the visible window.
+        if self.selected >= len(alerts):
+            self.selected = len(alerts) - 1
+        if self.selected < self.scroll:
+            self.scroll = self.selected
+        if self.selected >= self.scroll + VISIBLE:
+            self.scroll = self.selected - VISIBLE + 1
+
+        visible = alerts[self.scroll: self.scroll + VISIBLE]
+        for i, a in enumerate(visible):
+            y      = 68 + i * ROW_H
+            abs_i  = self.scroll + i
+            is_sel = (abs_i == self.selected)
+            kind   = a.get("kind") or "?"
+
+            if kind == "watchlist":
+                tag, stripe = "[WATCH] ", LOCKED_COL
+            elif kind in ("wifi_probe", "wifi_ap"):
+                tag, stripe = "[PHONE] ", RED
+            elif kind == "ble":
+                tag, stripe = "[BLE] ", CYAN
+            else:
+                tag, stripe = "", GREY
+
+            row_bg = BG_SEL if is_sel else BG_ROW
+            pygame.draw.rect(self.screen, row_bg, (0, y, 640, ROW_H - 2))
+            pygame.draw.rect(self.screen, stripe, (0, y, 5, ROW_H - 2))
+
+            ts_str = time.strftime("%H:%M:%S", time.localtime(a.get("ts", 0)))
+            mac    = a.get("mac")  or "?"
+            os_    = a.get("os")   or "?"
+            ssid   = a.get("ssid") or ""
+            rssi   = a.get("rssi", -100)
+
+            self.screen.blit(
+                self.font_small.render(
+                    f"{ts_str}  {tag}{os_}  {mac}",
+                    True, WHITE if is_sel else GREY
+                ),
+                (12, y + 4)
+            )
+            detail = a.get("dev_type") or ""
+            if ssid:
+                detail = f"{detail}  ssid:{ssid[:22]}"
+            self.screen.blit(
+                self.font_small.render(detail[:60], True, (90, 90, 110)),
+                (12, y + 24)
+            )
+            self.screen.blit(
+                self.font_rssi.render(f"{rssi}dBm", True, rssi_color(rssi)),
+                (530, y + 8)
+            )
+
+        self._draw_footer("up/dn:Scroll  Y:Tab")
+
     # ── Main render loop ─────────────────────────────────
 
     def _poll_alerts(self):
@@ -1119,6 +1410,8 @@ class Doperscope:
             self._draw_df_mode()
         elif self.view == "ble_df_mode" and self.ble_df_target:
             self._draw_ble_df_mode()
+        elif self.view == "phone_df_mode" and self.phone_df_target:
+            self._draw_phone_df_mode()
         elif self.view == "client_list" and self.locked:
             self._draw_client_list()
         elif self.tab == 1:
@@ -1127,6 +1420,8 @@ class Doperscope:
             self._draw_phones_list()
         elif self.tab == 3:
             self._draw_zigbee_list()
+        elif self.tab == 4:
+            self._draw_log_list()
         else:
             self._draw_ap_list()
         # Drawn last so it overlays whatever view is active.
