@@ -24,6 +24,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from input_handler import InputHandler
 from wifi_scanner import WiFiScanner
 from ble_scanner import BLEScanner
+from zigbee_scanner import ZigbeeScanner
 from persistence import Persistence
 
 # ── Colors ───────────────────────────────────────────────
@@ -45,7 +46,7 @@ LOCKED_COL = (255, 200,   0)
 
 WIFI_FILTERS = ["ALL", "2.4G", "5G"]
 SORTS        = ["rssi", "ssid", "channel"]
-TABS         = ["WiFi", "BLE"]
+TABS         = ["WiFi", "BLE", "Phones", "Zigbee"]
 
 # DF mode history length
 DF_HISTORY = 60
@@ -105,6 +106,7 @@ class Doperscope:
 
         self.scanner     = WiFiScanner("wlan1")
         self.ble         = BLEScanner()
+        self.zigbee      = ZigbeeScanner()
         self.inp         = InputHandler()
         self.persistence = Persistence(self.scanner, self.ble)
 
@@ -158,6 +160,7 @@ class Doperscope:
         self._bind_buttons()
         self.scanner.start()
         self.ble.start()
+        self.zigbee.start()
         self.persistence.start()
 
     # ── Button bindings ──────────────────────────────────
@@ -195,6 +198,10 @@ class Doperscope:
             items = self.scanner.get_clients(self.locked["bssid"])
         elif self.tab == 1:
             items = self.ble.get_devices()
+        elif self.tab == 2:
+            items = self.scanner.get_probes(phones_only=True)
+        elif self.tab == 3:
+            items = self.zigbee.get_devices()
         else:
             items = self._get_wifi_devices()
         self.selected = min(max(len(items) - 1, 0), self.selected + 1)
@@ -412,7 +419,10 @@ class Doperscope:
             self.last_tick_time = now
 
     def _draw_tabs(self):
-        tab_w = 120
+        # Auto-shrink tab width as tabs are added so right_text in the
+        # topbar still has room.
+        n     = len(TABS)
+        tab_w = 90 if n >= 4 else 120
         tab_h = 36
         for i, label in enumerate(TABS):
             x      = 10 + i * (tab_w + 8)
@@ -898,6 +908,182 @@ class Doperscope:
 
         self._draw_footer("↕:Scroll  X:Sort  Y:DF Mode  TB:WiFi Tab")
 
+    # ── Phones tab ───────────────────────────────────────
+
+    def _draw_phones_list(self):
+        probes = self.scanner.get_probes(phones_only=True)
+        n_phones    = sum(1 for p in probes if p.get("is_phone"))
+        n_watchlist = sum(1 for p in probes if p.get("is_watchlisted"))
+        self._draw_topbar(
+            right_text=f"{n_phones} PHONES  {n_watchlist} WATCH"
+        )
+
+        pygame.draw.rect(self.screen, (40, 8, 8), (0, 44, 640, 22))
+        self.screen.blit(
+            self.font_small.render(
+                "Live phone probes - watchlist first, then by signal", True, ORANGE
+            ), (8, 48)
+        )
+
+        ROW_H   = 70
+        VISIBLE = 5
+
+        if not probes:
+            self.screen.blit(
+                self.font_main.render("No phone probes detected.", True, GREY),
+                (155, 240)
+            )
+            self.screen.blit(
+                self.font_small.render(
+                    "Phones probe heavily on 5GHz - verify wlan1 is dual-band.",
+                    True, (90, 90, 110)
+                ),
+                (90, 274)
+            )
+        else:
+            visible = probes[self.scroll: self.scroll + VISIBLE]
+            for i, pr in enumerate(visible):
+                y      = 68 + i * ROW_H
+                abs_i  = self.scroll + i
+                is_sel = (abs_i == self.selected)
+                watch  = pr.get("is_watchlisted")
+
+                # Watchlist hits get a yellow accent stripe so they're
+                # distinguishable from regular phone detections at a glance.
+                row_bg = (50, 30, 0) if watch else ((40, 8, 8) if pr.get("is_phone") else BG_ROW)
+                if is_sel:
+                    row_bg = BG_SEL
+                pygame.draw.rect(self.screen, row_bg, (0, y, 640, ROW_H - 2))
+                stripe = LOCKED_COL if watch else (RED if pr.get("is_phone") else CYAN)
+                pygame.draw.rect(self.screen, stripe, (0, y, 5, ROW_H - 2))
+
+                if watch:
+                    tag = "[WATCH] "
+                elif pr.get("is_phone"):
+                    tag = "[PHONE] "
+                else:
+                    tag = ""
+
+                top_col = LOCKED_COL if watch else (RED if pr.get("is_phone") else WHITE)
+                self.screen.blit(
+                    self.font_main.render(
+                        f"{tag}{pr.get('os','?')}  {pr.get('dev_type','?')[:24]}",
+                        True, top_col
+                    ), (12, y + 5)
+                )
+
+                mac_count = len(pr.get("macs", [pr["mac"]]))
+                rotate    = f"  [{mac_count}x MAC]" if mac_count > 1 else ""
+                seeking   = pr.get("ssid", "<broadcast>")
+                if watch and pr.get("matched_ssids"):
+                    seeking = pr["matched_ssids"][0]
+                self.screen.blit(
+                    self.font_small.render(
+                        f"{pr['mac']}{rotate}", True, GREY
+                    ), (12, y + 34)
+                )
+                self.screen.blit(
+                    self.font_small.render(
+                        f"seeking: {seeking[:34]}", True, (90, 90, 110)
+                    ), (12, y + 52)
+                )
+                self.screen.blit(
+                    self.font_rssi.render(
+                        f"{pr['rssi']}dBm", True, rssi_color(pr["rssi"])
+                    ), (490, y + 5)
+                )
+                draw_signal_bars(self.screen, 580, y + 8, pr["rssi"], height=30)
+
+        self._draw_footer("up/dn:Scroll  Y:Tab  Edit ssid_watchlist.txt to tune")
+
+    # ── Zigbee tab ───────────────────────────────────────
+
+    def _draw_zigbee_list(self):
+        available = self.zigbee.is_available()
+        devs      = self.zigbee.get_devices() if available else []
+        status    = "PRESENT" if available else "NO DONGLE"
+        self._draw_topbar(right_text=f"{status}  {len(devs)}d")
+
+        if not available:
+            pygame.draw.rect(self.screen, (40, 8, 8), (0, 44, 640, 22))
+            self.screen.blit(
+                self.font_small.render("nRF52840 dongle not detected on USB.", True, ORANGE),
+                (8, 48)
+            )
+            lines = [
+                "Plug in the Raytac MDBT50Q-CX (nRF52840) and re-launch.",
+                "",
+                "When firmware is flashed:",
+                "  - nRF Sniffer for 802.15.4 -> Zigbee/Thread",
+                "  - or Sniffle -> BLE 5 long-range capture",
+                "",
+                "See zigbee_scanner.py for the integration TODO.",
+            ]
+            y = 90
+            for line in lines:
+                self.screen.blit(self.font_small.render(line, True, GREY), (24, y))
+                y += 26
+            self._draw_footer("Y:Tab")
+            return
+
+        pygame.draw.rect(self.screen, (8, 30, 30), (0, 44, 640, 22))
+        self.screen.blit(
+            self.font_small.render(
+                "nRF52840 detected. Scanner stub active - flash sniffer firmware to populate.",
+                True, CYAN
+            ),
+            (8, 48)
+        )
+
+        if not devs:
+            self.screen.blit(
+                self.font_main.render("Awaiting first Zigbee/Thread frame...", True, GREY),
+                (115, 240)
+            )
+            self.screen.blit(
+                self.font_small.render(
+                    "If this stays empty after flashing: tshark -i nrfsniffer to debug.",
+                    True, (90, 90, 110)
+                ),
+                (60, 274)
+            )
+        else:
+            ROW_H   = 70
+            VISIBLE = 5
+            visible = devs[self.scroll: self.scroll + VISIBLE]
+            for i, dev in enumerate(visible):
+                y      = 68 + i * ROW_H
+                abs_i  = self.scroll + i
+                is_sel = (abs_i == self.selected)
+                pygame.draw.rect(
+                    self.screen, BG_SEL if is_sel else BG_ROW,
+                    (0, y, 640, ROW_H - 2)
+                )
+                if is_sel:
+                    pygame.draw.rect(self.screen, CYAN, (0, y, 5, ROW_H - 2))
+                self.screen.blit(
+                    self.font_main.render(
+                        (dev.get("name") or "<unnamed>")[:28], True,
+                        WHITE if is_sel else GREY
+                    ), (12, y + 5)
+                )
+                self.screen.blit(
+                    self.font_small.render(
+                        f"PAN:{dev.get('pan_id','?')}  ch{dev.get('channel','?')}  "
+                        f"{dev.get('addr','?')}",
+                        True, CYAN
+                    ), (12, y + 34)
+                )
+                self.screen.blit(
+                    self.font_rssi.render(
+                        f"{dev.get('rssi', -100)}dBm",
+                        True, rssi_color(dev.get("rssi", -100))
+                    ), (490, y + 5)
+                )
+                draw_signal_bars(self.screen, 580, y + 8, dev.get("rssi", -100), height=30)
+
+        self._draw_footer("Y:Tab")
+
     # ── Main render loop ─────────────────────────────────
 
     def _poll_alerts(self):
@@ -905,7 +1091,11 @@ class Doperscope:
             self.alert_until = time.time() + ALERT_FLASH_S
             mac = alert.get("mac") or "?"
             os_ = alert.get("os")  or "?"
-            self.alert_text = f"PHONE DETECTED  {os_}  {mac}"
+            if alert.get("kind") == "watchlist":
+                ssid = alert.get("ssid") or "?"
+                self.alert_text = f"WATCHLIST HIT  '{ssid}'  {mac}"
+            else:
+                self.alert_text = f"PHONE DETECTED  {os_}  {mac}"
             if self.tick_sound:
                 try:
                     self.tick_sound.play()
@@ -933,6 +1123,10 @@ class Doperscope:
             self._draw_client_list()
         elif self.tab == 1:
             self._draw_ble_list()
+        elif self.tab == 2:
+            self._draw_phones_list()
+        elif self.tab == 3:
+            self._draw_zigbee_list()
         else:
             self._draw_ap_list()
         # Drawn last so it overlays whatever view is active.
@@ -973,6 +1167,7 @@ class Doperscope:
             self.fb.close()
             self.scanner.stop()
             self.ble.stop()
+            self.zigbee.stop()
             self.persistence.stop()
             self.inp.cleanup()
             pygame.quit()

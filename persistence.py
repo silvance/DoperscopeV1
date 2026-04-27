@@ -73,7 +73,7 @@ CREATE INDEX IF NOT EXISTS ix_ble_last_seen ON ble_devices(last_seen);
 CREATE TABLE IF NOT EXISTS phone_alerts (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     ts           REAL NOT NULL,
-    kind         TEXT NOT NULL,    -- 'wifi_probe' | 'wifi_ap' | 'ble'
+    kind         TEXT NOT NULL,    -- 'wifi_probe' | 'wifi_ap' | 'ble' | 'watchlist'
     fingerprint  TEXT,
     mac          TEXT,
     ssid         TEXT,
@@ -94,7 +94,10 @@ class Persistence:
         self._running = False
         self._thread  = None
 
-        self._seen_phone_fps = set()    # in-session dedup for alerts
+        # In-session dedup for alerts. Separate sets so a fingerprint can
+        # alert once as a phone AND once as a watchlist hit.
+        self._seen_phone_fps     = set()
+        self._seen_watchlist_fps = set()
         self._alert_queue    = queue.Queue()
 
     def start(self):
@@ -164,7 +167,8 @@ class Persistence:
             if ap.get("is_phone"):
                 self._maybe_alert(conn, "wifi_ap", ap.get("bssid"), ap.get("bssid"),
                                   ap.get("ssid"), "Hotspot", "WiFi AP",
-                                  ap["rssi"], ap)
+                                  ap["rssi"], ap,
+                                  seen_set=self._seen_phone_fps)
 
         for pr in self._wifi.get_probes():
             cur.execute(
@@ -195,7 +199,17 @@ class Persistence:
             if pr.get("is_phone"):
                 self._maybe_alert(conn, "wifi_probe", pr["fingerprint"], pr["mac"],
                                   pr.get("ssid"), pr.get("os"), pr.get("dev_type"),
-                                  pr["rssi"], pr)
+                                  pr["rssi"], pr,
+                                  seen_set=self._seen_phone_fps)
+            if pr.get("is_watchlisted"):
+                # Surface the matched watchlist SSID, not the most recent
+                # ssid value, since that's the actual operational signal.
+                matched = pr.get("matched_ssids") or []
+                hit_ssid = matched[0] if matched else pr.get("ssid")
+                self._maybe_alert(conn, "watchlist", pr["fingerprint"], pr["mac"],
+                                  hit_ssid, pr.get("os"), pr.get("dev_type"),
+                                  pr["rssi"], pr,
+                                  seen_set=self._seen_watchlist_fps)
 
         for dev in self._ble.get_devices():
             cur.execute(
@@ -221,10 +235,10 @@ class Persistence:
 
         conn.commit()
 
-    def _maybe_alert(self, conn, kind, fp, mac, ssid, os_, dev_type, rssi, raw):
-        if not fp or fp in self._seen_phone_fps:
+    def _maybe_alert(self, conn, kind, fp, mac, ssid, os_, dev_type, rssi, raw, seen_set):
+        if not fp or fp in seen_set:
             return
-        self._seen_phone_fps.add(fp)
+        seen_set.add(fp)
         alert = {
             "ts": time.time(),
             "kind": kind,

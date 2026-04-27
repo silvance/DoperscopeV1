@@ -1,9 +1,24 @@
+import os
 import threading
 import time
 import subprocess
 import warnings
 warnings.filterwarnings("ignore")
 from scapy.all import sniff, Dot11, Dot11Beacon, Dot11ProbeResp, Dot11ProbeReq, Dot11Elt, RadioTap
+
+
+def _load_ssid_watchlist(path):
+    """Load `ssid_watchlist.txt` once at scanner startup. Lower-cased for
+    case-insensitive comparison. Missing file = empty watchlist."""
+    if not os.path.isfile(path):
+        return set()
+    out = set()
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            line = line.split("#", 1)[0].strip()
+            if line:
+                out.add(line.lower())
+    return out
 
 OUI_TABLE = {
     "00:50:f2": "Microsoft",
@@ -369,7 +384,7 @@ def fingerprint_device(elt_layer):
 
 
 class WiFiScanner:
-    def __init__(self, interface="wlan1"):
+    def __init__(self, interface="wlan1", watchlist_path=None):
         self.interface = interface
         self.devices = {}
         self.clients = {}
@@ -380,6 +395,10 @@ class WiFiScanner:
         self.current_channel = 1
         self.locked_channel = None
         self.probes = {}
+
+        if watchlist_path is None:
+            watchlist_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ssid_watchlist.txt")
+        self.ssid_watchlist = _load_ssid_watchlist(watchlist_path)
 
         self.channels_24 = [1, 6, 11, 2, 7, 3, 8, 4, 9, 5, 10, 13]
         self.channels_5  = [36, 40, 44, 48, 52, 56, 60, 64,
@@ -430,6 +449,7 @@ class WiFiScanner:
                 # so all rotations collapse to a single tracked entry.
                 key = fp["fingerprint"]
                 is_phone = fp["os"] in PHONE_OS_TAGS
+                hit_watchlist = bool(ssid) and ssid.lower() in self.ssid_watchlist
                 now = time.time()
 
                 with self._lock:
@@ -443,22 +463,27 @@ class WiFiScanner:
                         if ssid:
                             existing["ssids_seen"].add(ssid)
                             existing["ssid"] = ssid
+                        if hit_watchlist:
+                            existing["is_watchlisted"] = True
+                            existing["matched_ssids"].add(ssid)
                     else:
                         self.probes[key] = {
-                            "mac":         mac,
-                            "macs":        {mac},
-                            "ssid":        ssid or "<broadcast>",
-                            "ssids_seen":  {ssid} if ssid else set(),
-                            "rssi":        rssi,
-                            "vendor":      get_vendor(mac),
-                            "os":          fp["os"],
-                            "dev_type":    fp["type"],
-                            "wifi_gen":    fp["wifi_gen"],
-                            "fingerprint": key,
-                            "is_phone":    is_phone,
-                            "first_seen":  now,
-                            "last_seen":   now,
-                            "hits":        1,
+                            "mac":             mac,
+                            "macs":            {mac},
+                            "ssid":            ssid or "<broadcast>",
+                            "ssids_seen":      {ssid} if ssid else set(),
+                            "rssi":            rssi,
+                            "vendor":          get_vendor(mac),
+                            "os":              fp["os"],
+                            "dev_type":        fp["type"],
+                            "wifi_gen":        fp["wifi_gen"],
+                            "fingerprint":     key,
+                            "is_phone":        is_phone,
+                            "is_watchlisted":  hit_watchlist,
+                            "matched_ssids":   {ssid} if hit_watchlist else set(),
+                            "first_seen":      now,
+                            "last_seen":       now,
+                            "hits":            1,
                         }
             except Exception:
                 pass
@@ -666,17 +691,22 @@ class WiFiScanner:
             for p in self.probes.values():
                 snapshot.append({
                     **p,
-                    "macs":       sorted(p["macs"]),
-                    "ssids_seen": sorted(p["ssids_seen"]),
+                    "macs":          sorted(p["macs"]),
+                    "ssids_seen":    sorted(p["ssids_seen"]),
+                    "matched_ssids": sorted(p.get("matched_ssids", [])),
                 })
         finally:
             self._lock.release()
         now = time.time()
         snapshot = [p for p in snapshot if now - p["last_seen"] < 30]
         if phones_only:
-            snapshot = [p for p in snapshot if p.get("is_phone")]
-        # Phones first, then by signal strength.
-        snapshot.sort(key=lambda p: (not p.get("is_phone"), -p["rssi"]))
+            snapshot = [p for p in snapshot if p.get("is_phone") or p.get("is_watchlisted")]
+        # Watchlisted first, then phones, then by signal strength.
+        snapshot.sort(key=lambda p: (
+            not p.get("is_watchlisted"),
+            not p.get("is_phone"),
+            -p["rssi"],
+        ))
         return snapshot
 
     def get_clients(self, bssid):

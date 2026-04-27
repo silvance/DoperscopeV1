@@ -1,0 +1,15 @@
+# Doperscope SSID watchlist.
+# One SSID per line. Match is case-insensitive, exact full-string match.
+# A '#' anywhere starts a comment for that line. Blank lines are ignored.
+#
+# Use case (SCIF):
+#   The probe-request fingerprint logic already alerts on phones generally.
+#   This list adds a second alert when a phone (or any client) sends a
+#   directed probe for an SSID on this list — useful for catching devices
+#   that are still configured for a sensitive network they shouldn't be
+#   carrying around.
+#
+# Examples:
+#   CompanyWiFi
+#   FacilityGuest
+#   SCIF-MGMT
