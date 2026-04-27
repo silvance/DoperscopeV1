@@ -78,6 +78,8 @@ def classify_device(name, manufacturer_data):
 
 class BLEScanner:
     def __init__(self):
+        # Keyed by fingerprint when one is meaningful, otherwise by MAC.
+        # See _store_advert for the rule.
         self.devices = {}
         self._lock    = threading.Lock()
         self._running = False
@@ -97,6 +99,18 @@ class BLEScanner:
         svc_str = ",".join(sorted(services))
         return f"{name}::{mfr_str}::{svc_str}"
 
+    @staticmethod
+    def _is_trivial_fp(name, mfr_data, services):
+        """A fingerprint is trivial if it carries no real signal — no
+        manufacturer data, no services, no usable name. Many unrelated
+        devices would collapse into one bucket if we keyed by it, so we
+        fall back to keying by MAC for those."""
+        if mfr_data:
+            return False
+        if services:
+            return False
+        return not name or name == "[unnamed]"
+
     def _detection_callback(self, device, advertisement_data):
         try:
             rssi   = advertisement_data.rssi if advertisement_data.rssi else -100
@@ -106,26 +120,44 @@ class BLEScanner:
             vendor = get_ble_vendor(mfr)
             dtype  = classify_device(name, mfr)
             svcs   = list(advertisement_data.service_uuids or [])
+            fp     = self._get_fingerprint(name, mfr, svcs)
+            now    = time.time()
 
-            # Generate the anti-randomization fingerprint
-            fp = self._get_fingerprint(name, mfr, svcs)
-
-            entry = {
-                "name":        name,
-                "mac":         mac,
-                "rssi":        rssi,
-                "vendor":      vendor,
-                "type":        dtype,
-                "services":    svcs,
-                "fingerprint": fp,
-                "last_seen":   time.time(),
-            }
+            # Devices with a real fingerprint collapse across MAC rotation;
+            # devices that broadcast nothing identifiable stay per-MAC.
+            key = mac if self._is_trivial_fp(name, mfr, svcs) else fp
 
             with self._lock:
-                existing = self.devices.get(mac)
+                existing = self.devices.get(key)
                 if existing:
-                    entry["rssi"] = int((existing["rssi"] + rssi) / 2)
-                self.devices[mac] = entry
+                    existing["mac"]        = mac
+                    existing["macs"].add(mac)
+                    existing["rssi"]       = int((existing["rssi"] + rssi) / 2)
+                    existing["last_seen"]  = now
+                    existing["hits"]      += 1
+                    # Later adverts may carry richer info than the first.
+                    if name and name != "[unnamed]":
+                        existing["name"] = name
+                    if svcs:
+                        existing["services"] = svcs
+                    if dtype and dtype != "BLE Device":
+                        existing["type"] = dtype
+                    if vendor and vendor != "Unknown":
+                        existing["vendor"] = vendor
+                else:
+                    self.devices[key] = {
+                        "name":        name,
+                        "mac":         mac,
+                        "macs":        {mac},
+                        "rssi":        rssi,
+                        "vendor":      vendor,
+                        "type":        dtype,
+                        "services":    svcs,
+                        "fingerprint": fp,
+                        "first_seen":  now,
+                        "last_seen":   now,
+                        "hits":        1,
+                    }
 
         except Exception as e:
             import traceback
@@ -153,7 +185,12 @@ class BLEScanner:
 
     def get_devices(self, sort_by="rssi"):
         with self._lock:
-            devs = list(self.devices.values())
+            # Snapshot with sets converted to sorted lists so callers don't
+            # see internal mutable state.
+            devs = [
+                {**d, "macs": sorted(d["macs"])}
+                for d in self.devices.values()
+            ]
         now  = time.time()
         devs = [d for d in devs if now - d["last_seen"] < 30]
         if sort_by == "rssi":

@@ -398,13 +398,15 @@ class Doperscope:
             if candidates:
                 # Grab the most recently seen candidate with this fingerprint
                 live = sorted(candidates, key=lambda x: x["last_seen"], reverse=True)[0]
-                # Silently update our locked target to the NEW MAC to continue tracking
-                self.ble_df_target["mac"] = live["mac"]
 
         if not live:
             self.ble_df_missing = True
             return
 
+        # Silently fold the latest MAC alias and rotation set onto our locked
+        # target so the DF header's rotation count stays current.
+        self.ble_df_target["mac"]  = live["mac"]
+        self.ble_df_target["macs"] = live.get("macs", [live["mac"]])
         self.ble_df_missing = False
         rssi = live["rssi"]
         self.ble_df_history.append(rssi)
@@ -823,9 +825,11 @@ class Doperscope:
 
         # MAC + vendor + suspicious flag
         pygame.draw.rect(self.screen, (25, 20, 10), (0, 44, 640, 24))
+        ble_mac_count = len(target.get("macs", [target["mac"]]))
+        ble_rotate    = f"  [{ble_mac_count}x MAC]" if ble_mac_count > 1 else ""
         self.screen.blit(
             self.font_small.render(
-                f"{target['mac']}  {target['vendor']}  {target['type']}",
+                f"{target['mac']}{ble_rotate}  {target['vendor']}  {target['type']}",
                 True, GREY
             ), (12, 50)
         )
@@ -1096,9 +1100,11 @@ class Doperscope:
                         f"{dev['type']}  ·  {dev['vendor']}", True, CYAN
                     ), (12, y + 34)
                 )
+                mac_count = len(dev.get("macs", [dev["mac"]]))
+                rotate    = f"  [{mac_count}x MAC]" if mac_count > 1 else ""
                 self.screen.blit(
                     self.font_small.render(
-                        f"{dev['mac']}  { (dev.get('fingerprint')[:32] + '...') if dev.get('fingerprint') and len(dev.get('fingerprint'))>35 else dev.get('fingerprint','')}",
+                        f"{dev['mac']}{rotate}",
                         True, (60, 60, 80)
                     ),
                     (12, y + 52)
