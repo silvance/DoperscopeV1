@@ -259,9 +259,40 @@ def get_band(channel):
         return "5G"
     return "2.4G"
 
+# OS fingerprints that indicate a mobile phone for SCIF-style alerting.
+PHONE_OS_TAGS = {"iPhone", "Apple", "Android", "Android/Win"}
+
+# Substrings that show up in personal-hotspot SSIDs across iOS / Android / locales.
+_HOTSPOT_NEEDLES = (
+    "iphone",
+    "ipad",
+    "android",
+    "androidap",
+    "pixel",
+    "galaxy",
+    "samsung",
+    "oneplus",
+    "redmi",
+    "xiaomi",
+    "huawei",
+    "hotspot",
+)
+
+def looks_like_phone_hotspot(ssid):
+    """Heuristic: does this SSID look like a phone's personal hotspot?"""
+    if not ssid:
+        return False
+    s = ssid.lower()
+    return any(needle in s for needle in _HOTSPOT_NEEDLES)
+
 def fingerprint_device(elt_layer):
     """Fingerprint device OS/type from 802.11 Information Elements.
-    Based on real-world probe request analysis."""
+    Based on real-world probe request analysis.
+
+    Returns a dict that includes a stable `fingerprint` string built from
+    the IE order + vendor OUI list. Used to defeat MAC randomization:
+    two probes from the same device share an IE fingerprint even if the
+    MAC rotates."""
     ht  = False
     vht = False
     he  = False
@@ -288,12 +319,13 @@ def fingerprint_device(elt_layer):
         except:
             break
 
+    fingerprint = "ie:" + ",".join(str(i) for i in ie_order) + "|oui:" + ",".join(sorted(set(vendor_ouis)))
+
     # OUI signatures (from real captures)
     has_apple  = "8cfdf0" in vendor_ouis  # Apple Inc - definitive
     has_ms     = "0050f2" in vendor_ouis  # Microsoft WPS
     has_wfd    = "506f9a" in vendor_ouis  # Wi-Fi Alliance P2P/Direct (Android)
 
-    # WiFi generation
     if he:
         wifi_gen = "WiFi 6"
     elif vht:
@@ -303,48 +335,37 @@ def fingerprint_device(elt_layer):
     else:
         wifi_gen = "WiFi 3"
 
-    # iOS/iPhone — Apple OUI present
     if has_apple and has_ms:
-        if he:
-            return {"os": "iPhone", "type": "iPhone (iOS 14+)", "wifi_gen": wifi_gen, "ht": ht, "vht": vht, "he": he}
-        elif vht:
-            return {"os": "iPhone", "type": "iPhone (iOS 11-13)", "wifi_gen": wifi_gen, "ht": ht, "vht": vht, "he": he}
-        else:
-            return {"os": "iPhone", "type": "iPhone (older iOS)", "wifi_gen": wifi_gen, "ht": ht, "vht": vht, "he": he}
-
-    if has_apple:
-        return {"os": "Apple", "type": "Apple Device", "wifi_gen": wifi_gen, "ht": ht, "vht": vht, "he": he}
-
-    # iOS without Apple OUI (privacy mode, no VHT quirk)
-    if not vendor_ouis and he and not vht and ie_order[:4] == [0, 1, 50, 3]:
-        return {"os": "iPhone", "type": "iPhone (privacy mode)", "wifi_gen": wifi_gen, "ht": ht, "vht": vht, "he": he}
-
-    # Android — Wi-Fi Direct OUI present
-    if has_wfd and has_ms:
-        if he:
-            return {"os": "Android", "type": "Android (v10+)", "wifi_gen": wifi_gen, "ht": ht, "vht": vht, "he": he}
-        elif vht:
-            return {"os": "Android", "type": "Android (v7-9)", "wifi_gen": wifi_gen, "ht": ht, "vht": vht, "he": he}
-        else:
-            return {"os": "Android", "type": "Android (older)", "wifi_gen": wifi_gen, "ht": ht, "vht": vht, "he": he}
-
-    if has_wfd:
-        return {"os": "Android", "type": "Android Device", "wifi_gen": wifi_gen, "ht": ht, "vht": vht, "he": he}
-
-    # Microsoft WPS only — Windows or older Android
-    if has_ms and not has_wfd:
+        if he:     os_, dtype = "iPhone", "iPhone (iOS 14+)"
+        elif vht:  os_, dtype = "iPhone", "iPhone (iOS 11-13)"
+        else:      os_, dtype = "iPhone", "iPhone (older iOS)"
+    elif has_apple:
+        os_, dtype = "Apple", "Apple Device"
+    elif not vendor_ouis and he and not vht and ie_order[:4] == [0, 1, 50, 3]:
+        os_, dtype = "iPhone", "iPhone (privacy mode)"
+    elif has_wfd and has_ms:
+        if he:     os_, dtype = "Android", "Android (v10+)"
+        elif vht:  os_, dtype = "Android", "Android (v7-9)"
+        else:      os_, dtype = "Android", "Android (older)"
+    elif has_wfd:
+        os_, dtype = "Android", "Android Device"
+    elif has_ms:
         if ht and not vht:
-            return {"os": "Android/Win", "type": "Android or Windows", "wifi_gen": wifi_gen, "ht": ht, "vht": vht, "he": he}
-        return {"os": "Unknown", "type": "WPS Device", "wifi_gen": wifi_gen, "ht": ht, "vht": vht, "he": he}
+            os_, dtype = "Android/Win", "Android or Windows"
+        else:
+            os_, dtype = "Unknown", "WPS Device"
+    elif he:
+        os_, dtype = "Unknown", "Unknown (WiFi 6)"
+    elif ht:
+        os_, dtype = "Unknown", "Unknown (WiFi 4)"
+    else:
+        os_, dtype = "Unknown", "Unknown Device"
 
-    # No vendor IEs
-    if not vendor_ouis:
-        if he:
-            return {"os": "Unknown", "type": "Unknown (WiFi 6)", "wifi_gen": wifi_gen, "ht": ht, "vht": vht, "he": he}
-        elif ht:
-            return {"os": "Unknown", "type": "Unknown (WiFi 4)", "wifi_gen": wifi_gen, "ht": ht, "vht": vht, "he": he}
-
-    return {"os": "Unknown", "type": "Unknown Device", "wifi_gen": wifi_gen, "ht": ht, "vht": vht, "he": he}
+    return {
+        "os": os_, "type": dtype, "wifi_gen": wifi_gen,
+        "ht": ht, "vht": vht, "he": he,
+        "fingerprint": fingerprint,
+    }
 
 
 class WiFiScanner:
@@ -393,27 +414,52 @@ class WiFiScanner:
                         pass
 
                 # IE fingerprinting
-                fp = {"os": "Unknown", "type": "Unknown Device", "wifi_gen": "Unknown", "ht": False, "vht": False, "he": False}
+                fp = {
+                    "os": "Unknown", "type": "Unknown Device",
+                    "wifi_gen": "Unknown", "ht": False, "vht": False, "he": False,
+                    "fingerprint": "ie:|oui:",
+                }
                 try:
                     if pkt.haslayer(Dot11Elt):
                         fp = fingerprint_device(pkt.getlayer(Dot11Elt))
                 except:
                     pass
 
+                # Key probes by IE fingerprint, not MAC. A randomized iPhone
+                # rotates MACs every ~30 min but its IE fingerprint is stable,
+                # so all rotations collapse to a single tracked entry.
+                key = fp["fingerprint"]
+                is_phone = fp["os"] in PHONE_OS_TAGS
+                now = time.time()
+
                 with self._lock:
-                    existing = self.probes.get(mac)
+                    existing = self.probes.get(key)
                     if existing:
-                        rssi = int((existing["rssi"] + rssi) / 2)
-                    self.probes[mac] = {
-                        "mac":       mac,
-                        "ssid":      ssid or "<broadcast>",
-                        "rssi":      rssi,
-                        "vendor":    get_vendor(mac),
-                        "os":        fp["os"],
-                        "dev_type":  fp["type"],
-                        "wifi_gen":  fp["wifi_gen"],
-                        "last_seen": time.time(),
-                    }
+                        existing["mac"]        = mac
+                        existing["macs"].add(mac)
+                        existing["rssi"]       = int((existing["rssi"] + rssi) / 2)
+                        existing["last_seen"]  = now
+                        existing["hits"]      += 1
+                        if ssid:
+                            existing["ssids_seen"].add(ssid)
+                            existing["ssid"] = ssid
+                    else:
+                        self.probes[key] = {
+                            "mac":         mac,
+                            "macs":        {mac},
+                            "ssid":        ssid or "<broadcast>",
+                            "ssids_seen":  {ssid} if ssid else set(),
+                            "rssi":        rssi,
+                            "vendor":      get_vendor(mac),
+                            "os":          fp["os"],
+                            "dev_type":    fp["type"],
+                            "wifi_gen":    fp["wifi_gen"],
+                            "fingerprint": key,
+                            "is_phone":    is_phone,
+                            "first_seen":  now,
+                            "last_seen":   now,
+                            "hits":        1,
+                        }
             except Exception:
                 pass
             return
@@ -461,6 +507,7 @@ class WiFiScanner:
                 "band":      band,
                 "vendor":    vendor,
                 "hidden":    hidden,
+                "is_phone":  looks_like_phone_hotspot(ssid),
                 "last_seen": time.time(),
             }
 
@@ -609,17 +656,28 @@ class WiFiScanner:
             devs.sort(key=lambda d: d["channel"])
         return devs
 
-    def get_probes(self):
+    def get_probes(self, phones_only=False):
         if not self._lock.acquire(timeout=0.5):
             return []
         try:
-            probes = list(self.probes.values())
+            # Snapshot with sets converted to sorted lists so callers don't
+            # see internal mutable state.
+            snapshot = []
+            for p in self.probes.values():
+                snapshot.append({
+                    **p,
+                    "macs":       sorted(p["macs"]),
+                    "ssids_seen": sorted(p["ssids_seen"]),
+                })
         finally:
             self._lock.release()
         now = time.time()
-        probes = [p for p in probes if now - p["last_seen"] < 30]
-        probes.sort(key=lambda p: p["rssi"], reverse=True)
-        return probes
+        snapshot = [p for p in snapshot if now - p["last_seen"] < 30]
+        if phones_only:
+            snapshot = [p for p in snapshot if p.get("is_phone")]
+        # Phones first, then by signal strength.
+        snapshot.sort(key=lambda p: (not p.get("is_phone"), -p["rssi"]))
+        return snapshot
 
     def get_clients(self, bssid):
         if not self._lock.acquire(timeout=0.5):

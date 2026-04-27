@@ -20,10 +20,11 @@ try:
 except:
     pass
 
-sys.path.insert(0, '/home/silvance/dopescope')
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from input_handler import InputHandler
 from wifi_scanner import WiFiScanner
 from ble_scanner import BLEScanner
+from persistence import Persistence
 
 # ── Colors ───────────────────────────────────────────────
 BG         = (10,  10,  30)
@@ -48,6 +49,9 @@ TABS         = ["WiFi", "BLE"]
 
 # DF mode history length
 DF_HISTORY = 60
+
+# How long the red phone-alert banner stays visible after a new detection.
+ALERT_FLASH_S = 4.0
 
 
 def rssi_color(rssi):
@@ -99,9 +103,15 @@ class Doperscope:
         self.font_huge   = pygame.font.SysFont(None, 96)
         self.font_large  = pygame.font.SysFont(None, 56)
 
-        self.scanner = WiFiScanner("wlan1")
-        self.ble     = BLEScanner()
-        self.inp     = InputHandler()
+        self.scanner     = WiFiScanner("wlan1")
+        self.ble         = BLEScanner()
+        self.inp         = InputHandler()
+        self.persistence = Persistence(self.scanner, self.ble)
+
+        # Phone-alert UI state: when a new phone fingerprint shows up the
+        # banner stays red for ALERT_FLASH_S so it's visible during a sweep.
+        self.alert_until = 0.0
+        self.alert_text  = ""
 
         # Tab + filter state
         self.tab         = 0
@@ -148,6 +158,7 @@ class Doperscope:
         self._bind_buttons()
         self.scanner.start()
         self.ble.start()
+        self.persistence.start()
 
     # ── Button bindings ──────────────────────────────────
 
@@ -511,17 +522,23 @@ class Doperscope:
             )
             for i, probe in enumerate(probes[:probe_rows]):
                 py = probe_y + 22 + i * 48
-                pygame.draw.rect(self.screen, (20, 8, 8), (0, py, 640, 46))
+                is_phone   = probe.get("is_phone", False)
+                row_bg     = (40, 8, 8) if is_phone else (20, 8, 8)
+                top_col    = RED if is_phone else ORANGE
+                pygame.draw.rect(self.screen, row_bg, (0, py, 640, 46))
                 pygame.draw.rect(self.screen, RED, (0, py, 3, 46))
+                mac_count  = len(probe.get("macs", [probe["mac"]]))
+                rotate_tag = f"  [{mac_count}x MAC]" if mac_count > 1 else ""
+                tag        = "[PHONE] " if is_phone else ""
                 self.screen.blit(
                     self.font_small.render(
-                        f"{probe['mac']}  {probe.get('vendor','?')}  {probe.get('wifi_gen','?')}",
-                        True, ORANGE
+                        f"{tag}{probe.get('os','?')}  {probe.get('dev_type','?')[:22]}  {probe.get('wifi_gen','?')}",
+                        True, top_col
                     ), (8, py + 4)
                 )
                 self.screen.blit(
                     self.font_small.render(
-                        f"{probe.get('os','?')}  seeking:{probe['ssid'][:20]}",
+                        f"{probe['mac']}{rotate_tag}  seeking:{probe['ssid'][:18]}",
                         True, GREY
                     ), (8, py + 24)
                 )
@@ -883,8 +900,31 @@ class Doperscope:
 
     # ── Main render loop ─────────────────────────────────
 
+    def _poll_alerts(self):
+        for alert in self.persistence.pop_new_phone_alerts():
+            self.alert_until = time.time() + ALERT_FLASH_S
+            mac = alert.get("mac") or "?"
+            os_ = alert.get("os")  or "?"
+            self.alert_text = f"PHONE DETECTED  {os_}  {mac}"
+            if self.tick_sound:
+                try:
+                    self.tick_sound.play()
+                except Exception:
+                    pass
+
+    def _draw_alert_banner(self):
+        if time.time() >= self.alert_until:
+            return
+        # Pulse red so it's hard to miss in a sweep.
+        pulse = int((time.time() * 4) % 2)
+        col = (255, 30, 30) if pulse else (200, 0, 0)
+        pygame.draw.rect(self.screen, col, (0, 0, 640, 44))
+        txt = self.font_main.render(self.alert_text[:60], True, WHITE)
+        self.screen.blit(txt, (10, 10))
+
     def _render(self):
         self.screen.fill(BG)
+        self._poll_alerts()
         if self.view == "df_mode" and self.locked:
             self._draw_df_mode()
         elif self.view == "ble_df_mode" and self.ble_df_target:
@@ -895,6 +935,8 @@ class Doperscope:
             self._draw_ble_list()
         else:
             self._draw_ap_list()
+        # Drawn last so it overlays whatever view is active.
+        self._draw_alert_banner()
         pygame.display.flip()
         raw = pygame.image.tostring(self.screen, "BGRA")
         self.fb.seek(0)
@@ -931,6 +973,7 @@ class Doperscope:
             self.fb.close()
             self.scanner.stop()
             self.ble.stop()
+            self.persistence.stop()
             self.inp.cleanup()
             pygame.quit()
 
