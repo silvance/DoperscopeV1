@@ -167,6 +167,9 @@ class Doperscope:
         # the captured-sweep list. X cycles between them on tab 4.
         self.log_view = "sweeps"
 
+        # Sweep-detail drill-down: which sweep id we're currently viewing.
+        self.sweep_detail_id = None
+
         self.ROWS_VISIBLE = 5
         self.ROW_H        = 70
 
@@ -209,7 +212,9 @@ class Doperscope:
             self.scroll = self.selected
 
     def _scroll_down(self):
-        if self.view == "client_list":
+        if self.view == "sweep_detail" and self.sweep_detail_id is not None:
+            items = self.persistence.get_sweep_observations(self.sweep_detail_id)
+        elif self.view == "client_list":
             items = self.scanner.get_clients(self.locked["bssid"])
         elif self.tab == 1:
             items = self.ble.get_devices()
@@ -238,6 +243,14 @@ class Doperscope:
                 self.view     = "client_list"
                 self.selected = 0
                 self.scroll   = 0
+        elif self.tab == 4 and self.view == "ap_list" and self.log_view == "sweeps":
+            # A on a sweep row drills into the captured observations.
+            sweeps = self.persistence.list_sweeps()
+            if sweeps and 0 <= self.selected < len(sweeps):
+                self.sweep_detail_id = sweeps[self.selected]["id"]
+                self.view            = "sweep_detail"
+                self.selected        = 0
+                self.scroll          = 0
 
     def _action_b(self):
         if self.view == "ap_list" and self.tab == 0:
@@ -282,17 +295,18 @@ class Doperscope:
                 self.phone_df_last    = -100
                 self.phone_df_trend   = "STEADY"
                 self.phone_df_missing = False
-        elif self.view in ("client_list", "df_mode", "ble_df_mode", "phone_df_mode"):
+        elif self.view in ("client_list", "df_mode", "ble_df_mode", "phone_df_mode", "sweep_detail"):
             self.view     = "ap_list"
             self.selected = 0
             self.scroll   = 0
             self.locked   = None
             self.phone_df_target = None
+            self.sweep_detail_id = None
             self.scanner.locked_channel = None
 
     def _action_y(self):
         # Y (shoulder): switch tabs
-        if self.view in ("client_list", "df_mode", "phone_df_mode"):
+        if self.view in ("client_list", "df_mode", "phone_df_mode", "sweep_detail"):
             return
         self.tab      = (self.tab + 1) % len(TABS)
         self.selected = 0
@@ -312,6 +326,11 @@ class Doperscope:
             self.phone_df_peak = self.phone_df_last
             self.phone_df_history.clear()
             self.phone_df_missing = False
+        elif self.view == "sweep_detail":
+            self.view            = "ap_list"
+            self.sweep_detail_id = None
+            self.selected        = 0
+            self.scroll          = 0
         else:
             self.locked   = None
             self.view     = "ap_list"
@@ -319,13 +338,14 @@ class Doperscope:
             self.scroll   = 0
 
     def _action_joy(self):
-        if self.view in ("client_list", "df_mode", "ble_df_mode", "phone_df_mode"):
+        if self.view in ("client_list", "df_mode", "ble_df_mode", "phone_df_mode", "sweep_detail"):
             self.view     = "ap_list"
             self.selected = 0
             self.scroll   = 0
             self.locked   = None
             self.ble_df_target   = None
             self.phone_df_target = None
+            self.sweep_detail_id = None
 
     def _cycle_sort(self):
         # On the Log tab X swaps between the sweeps view and the
@@ -1510,7 +1530,119 @@ class Doperscope:
                 (260, y + 24)
             )
 
-        self._draw_footer("up/dn:Scroll  B:Toggle Sweep  X:Alerts  Y:Tab")
+        self._draw_footer("A:Open  up/dn:Scroll  B:Toggle Sweep  X:Alerts  Y:Tab")
+
+    # ── Sweep detail drill-down ──────────────────────────
+
+    def _draw_sweep_detail(self):
+        sid = self.sweep_detail_id
+        sweep = self.persistence.get_sweep(sid) if sid is not None else None
+        if not sweep:
+            # Sweep id no longer resolvable (deleted, db error). Bail out.
+            self.view = "ap_list"
+            self.sweep_detail_id = None
+            return
+
+        observations = self.persistence.get_sweep_observations(sid)
+
+        # Header band
+        pygame.draw.rect(self.screen, BG_HEADER, (0, 0, 640, 44))
+        title = f"SWEEP #{sweep['id']}"
+        if sweep["active"]:
+            title += " ● LIVE"
+        self.screen.blit(self.font_title.render(title, True, LOCKED_COL), (12, 8))
+
+        start_str = time.strftime("%m-%d %H:%M:%S", time.localtime(sweep["start_ts"]))
+        if sweep["active"]:
+            dur = max(0, int(time.time() - sweep["start_ts"]))
+        elif sweep["end_ts"]:
+            dur = int(sweep["end_ts"] - sweep["start_ts"])
+        else:
+            dur = 0
+        mm, ss = divmod(dur, 60)
+        meta = f"{start_str}  ·  {mm}:{ss:02d}  ·  {len(observations)} dev"
+        self.screen.blit(self.font_small.render(meta, True, GREY), (320, 18))
+
+        # Counts band
+        pygame.draw.rect(self.screen, (25, 20, 10), (0, 44, 640, 24))
+        phone_col = RED if sweep["phones_seen"] else GREY
+        watch_col = LOCKED_COL if sweep["watch_hits"] else GREY
+        self.screen.blit(self.font_small.render(
+            f"{sweep['devices_seen']} devices", True, GREY), (12, 50))
+        self.screen.blit(self.font_small.render(
+            f"·  {sweep['phones_seen']} phones", True, phone_col), (140, 50))
+        self.screen.blit(self.font_small.render(
+            f"·  {sweep['watch_hits']} watchlist hits", True, watch_col), (300, 50))
+
+        ROW_H   = 50
+        VISIBLE = 7
+
+        if not observations:
+            self.screen.blit(
+                self.font_main.render("No observations captured.", True, GREY),
+                (170, 240)
+            )
+            self._draw_footer("Joy/Start:Back")
+            return
+
+        if self.selected >= len(observations):
+            self.selected = len(observations) - 1
+        if self.selected < self.scroll:
+            self.scroll = self.selected
+        if self.selected >= self.scroll + VISIBLE:
+            self.scroll = self.selected - VISIBLE + 1
+
+        visible = observations[self.scroll: self.scroll + VISIBLE]
+        for i, ob in enumerate(visible):
+            y      = 68 + i * ROW_H
+            abs_i  = self.scroll + i
+            is_sel = (abs_i == self.selected)
+
+            kind = ob["kind"]
+            if ob["is_watch"]:
+                tag, stripe = "[WATCH] ", LOCKED_COL
+                top_col = LOCKED_COL
+            elif ob["is_phone"]:
+                tag, stripe = "[PHONE] ", RED
+                top_col = RED
+            elif kind == "ble":
+                tag, stripe = "[BLE] ", CYAN
+                top_col = WHITE if is_sel else GREY
+            elif kind == "wifi_ap":
+                tag, stripe = "[AP] ", CYAN
+                top_col = WHITE if is_sel else GREY
+            else:
+                tag, stripe = "[?] ", GREY
+                top_col = WHITE if is_sel else GREY
+
+            row_bg = BG_SEL if is_sel else BG_ROW
+            pygame.draw.rect(self.screen, row_bg, (0, y, 640, ROW_H - 2))
+            pygame.draw.rect(self.screen, stripe, (0, y, 5, ROW_H - 2))
+
+            label = ob.get("label") or ob["key"][:24]
+            os_   = ob.get("os")    or ""
+            top_str = f"{tag}{os_}  {label[:30]}".strip()
+            self.screen.blit(
+                self.font_small.render(top_str[:60], True, top_col),
+                (12, y + 4)
+            )
+
+            dev_type = ob.get("dev_type") or kind
+            self.screen.blit(
+                self.font_small.render(
+                    f"{dev_type[:24]}  ·  {ob['hits']} hits  ·  {ob['key'][:20]}",
+                    True, (90, 90, 110)
+                ),
+                (12, y + 24)
+            )
+            self.screen.blit(
+                self.font_rssi.render(
+                    f"{ob['rssi_max']}dBm", True, rssi_color(ob["rssi_max"])
+                ),
+                (530, y + 8)
+            )
+
+        self._draw_footer("up/dn:Scroll  Joy/Start:Back")
 
     # ── Main render loop ─────────────────────────────────
 
@@ -1549,6 +1681,8 @@ class Doperscope:
             self._draw_ble_df_mode()
         elif self.view == "phone_df_mode" and self.phone_df_target:
             self._draw_phone_df_mode()
+        elif self.view == "sweep_detail" and self.sweep_detail_id is not None:
+            self._draw_sweep_detail()
         elif self.view == "client_list" and self.locked:
             self._draw_client_list()
         elif self.tab == 1:

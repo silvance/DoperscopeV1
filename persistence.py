@@ -260,6 +260,62 @@ class Persistence:
             for r in rows
         ]
 
+    def get_sweep_observations(self, sweep_id, limit=500):
+        """Return every distinct device captured during a sweep, sorted
+        watchlist-first, then phones, then by max RSSI seen during the
+        capture window."""
+        try:
+            conn = sqlite3.connect(self._db_path)
+            try:
+                rows = conn.execute(
+                    """SELECT kind, key, label, os, dev_type, is_phone, is_watch,
+                              rssi_max, rssi_last, first_seen, last_seen, hits
+                         FROM sweep_observations
+                         WHERE sweep_id = ?
+                         ORDER BY is_watch DESC, is_phone DESC, rssi_max DESC
+                         LIMIT ?""",
+                    (sweep_id, limit),
+                ).fetchall()
+            finally:
+                conn.close()
+        except Exception:
+            return []
+        return [
+            {
+                "kind": r[0], "key": r[1], "label": r[2],
+                "os": r[3], "dev_type": r[4],
+                "is_phone": bool(r[5]), "is_watch": bool(r[6]),
+                "rssi_max": r[7], "rssi_last": r[8],
+                "first_seen": r[9], "last_seen": r[10],
+                "hits": r[11] or 0,
+            }
+            for r in rows
+        ]
+
+    def get_sweep(self, sweep_id):
+        """Fetch a single sweep header row by id."""
+        try:
+            conn = sqlite3.connect(self._db_path)
+            try:
+                r = conn.execute(
+                    """SELECT id, start_ts, end_ts, label, devices_seen,
+                              phones_seen, watch_hits
+                         FROM sweeps WHERE id = ?""",
+                    (sweep_id,),
+                ).fetchone()
+            finally:
+                conn.close()
+        except Exception:
+            return None
+        if not r:
+            return None
+        return {
+            "id": r[0], "start_ts": r[1], "end_ts": r[2], "label": r[3],
+            "devices_seen": r[4] or 0, "phones_seen": r[5] or 0,
+            "watch_hits": r[6] or 0,
+            "active": (r[0] == self.active_sweep_id()),
+        }
+
     def get_recent_alerts(self, limit=50):
         """Read the most recent alerts from disk for the Log tab. Opens a
         fresh read-only connection so it's safe to call from the UI thread."""
