@@ -348,8 +348,18 @@ class Doperscope:
             self.sweep_detail_id = None
 
     def _cycle_sort(self):
-        # On the Log tab X swaps between the sweeps view and the
-        # alerts view instead of cycling the (irrelevant) sort.
+        # X is contextual:
+        #  - on the Log tab, swap between sweeps and alerts subviews
+        #  - inside a sweep_detail view, export that sweep to CSV
+        #  - everywhere else, cycle the sort order
+        if self.view == "sweep_detail" and self.sweep_detail_id is not None:
+            path = self.persistence.export_sweep_csv(self.sweep_detail_id)
+            self.alert_until = time.time() + ALERT_FLASH_S
+            if path:
+                self.alert_text = f"EXPORTED  {os.path.basename(path)}"
+            else:
+                self.alert_text = "EXPORT FAILED"
+            return
         if self.tab == 4:
             self.log_view = "alerts" if self.log_view == "sweeps" else "sweeps"
             self.selected = 0
@@ -1642,7 +1652,7 @@ class Doperscope:
                 (530, y + 8)
             )
 
-        self._draw_footer("up/dn:Scroll  Joy/Start:Back")
+        self._draw_footer("up/dn:Scroll  X:Export CSV  Joy/Start:Back")
 
     # ── Main render loop ─────────────────────────────────
 
@@ -1665,9 +1675,14 @@ class Doperscope:
     def _draw_alert_banner(self):
         if time.time() >= self.alert_until:
             return
-        # Pulse red so it's hard to miss in a sweep.
+        # Pulse so it's hard to miss in a sweep. Green for benign status
+        # (export succeeded), red for everything else (phone / watchlist /
+        # export failure). The text itself already conveys which one.
         pulse = int((time.time() * 4) % 2)
-        col = (255, 30, 30) if pulse else (200, 0, 0)
+        if self.alert_text.startswith("EXPORTED"):
+            col = (40, 200, 80) if pulse else (10, 140, 50)
+        else:
+            col = (255, 30, 30) if pulse else (200, 0, 0)
         pygame.draw.rect(self.screen, col, (0, 0, 640, 44))
         txt = self.font_main.render(self.alert_text[:60], True, WHITE)
         self.screen.blit(txt, (10, 10))
