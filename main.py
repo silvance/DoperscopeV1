@@ -163,6 +163,10 @@ class Doperscope:
         self.phone_df_trend   = "STEADY"
         self.phone_df_missing = False
 
+        # Log tab subview: "alerts" shows phone_alerts, "sweeps" shows
+        # the captured-sweep list. X cycles between them on tab 4.
+        self.log_view = "sweeps"
+
         self.ROWS_VISIBLE = 5
         self.ROW_H        = 70
 
@@ -214,7 +218,10 @@ class Doperscope:
         elif self.tab == 3:
             items = self.zigbee.get_devices()
         elif self.tab == 4:
-            items = self.persistence.get_recent_alerts()
+            if self.log_view == "sweeps":
+                items = self.persistence.list_sweeps()
+            else:
+                items = self.persistence.get_recent_alerts()
         else:
             items = self._get_wifi_devices()
         self.selected = min(max(len(items) - 1, 0), self.selected + 1)
@@ -256,6 +263,13 @@ class Doperscope:
                 self.ble_df_last    = -100
                 self.ble_df_trend   = "STEADY"
                 self.ble_df_missing = False
+        elif self.view == "ap_list" and self.tab == 4:
+            # Log tab — B toggles the active sweep.
+            if self.persistence.is_sweep_active():
+                self.persistence.end_sweep()
+            else:
+                self.persistence.start_sweep()
+            return
         elif self.view == "ap_list" and self.tab == 2:
             # Phone DF mode — fingerprint-locked.
             probes = self.scanner.get_probes(phones_only=True)
@@ -314,6 +328,13 @@ class Doperscope:
             self.phone_df_target = None
 
     def _cycle_sort(self):
+        # On the Log tab X swaps between the sweeps view and the
+        # alerts view instead of cycling the (irrelevant) sort.
+        if self.tab == 4:
+            self.log_view = "alerts" if self.log_view == "sweeps" else "sweeps"
+            self.selected = 0
+            self.scroll   = 0
+            return
         self.sort_idx = (self.sort_idx + 1) % len(SORTS)
 
     def _cycle_wifi_filter(self):
@@ -519,9 +540,19 @@ class Doperscope:
     def _draw_topbar(self, right_text=""):
         pygame.draw.rect(self.screen, BG_HEADER, (0, 0, 640, 44))
         self._draw_tabs()
-        if right_text:
+        # Active-sweep prefix in the right_text so the operator can see
+        # it from any tab without leaving their current view.
+        if self.persistence.is_sweep_active():
+            elapsed = int(time.time() - self.persistence.active_sweep_started_at())
+            mm, ss  = divmod(max(0, elapsed), 60)
+            sweep_str = f"● SWEEP {mm}:{ss:02d}"
+            full = f"{sweep_str}  {right_text}" if right_text else sweep_str
+            rt = self.font_small.render(full, True, RED)
+        else:
+            if not right_text:
+                return
             rt = self.font_small.render(right_text, True, GREY)
-            self.screen.blit(rt, (640 - rt.get_width() - 10, 14))
+        self.screen.blit(rt, (640 - rt.get_width() - 10, 14))
 
     def _draw_footer(self, text):
         pygame.draw.rect(self.screen, BG_FOOTER, (0, 440, 640, 40))
@@ -1297,6 +1328,9 @@ class Doperscope:
     # ── Alert log tab ────────────────────────────────────
 
     def _draw_log_list(self):
+        if self.log_view == "sweeps":
+            self._draw_sweeps_view()
+            return
         alerts = self.persistence.get_recent_alerts(limit=200)
         n = len(alerts)
         self._draw_topbar(right_text=f"{n} alerts")
@@ -1304,7 +1338,7 @@ class Doperscope:
         pygame.draw.rect(self.screen, (40, 8, 8), (0, 44, 640, 22))
         self.screen.blit(
             self.font_small.render(
-                "Persistent phone-alert history (most recent first)", True, ORANGE
+                "Alerts (most recent first)  — X: switch to Sweeps", True, ORANGE
             ), (8, 48)
         )
 
@@ -1379,7 +1413,104 @@ class Doperscope:
                 (530, y + 8)
             )
 
-        self._draw_footer("up/dn:Scroll  Y:Tab")
+        self._draw_footer("up/dn:Scroll  X:Sweeps  B:Toggle Sweep  Y:Tab")
+
+    # ── Sweeps subview ───────────────────────────────────
+
+    def _draw_sweeps_view(self):
+        sweeps = self.persistence.list_sweeps(limit=50)
+        active = self.persistence.is_sweep_active()
+        self._draw_topbar(right_text=f"{len(sweeps)} sweeps")
+
+        pygame.draw.rect(self.screen, (40, 8, 8), (0, 44, 640, 22))
+        hint = ("Sweep ACTIVE — B to STOP  ·  X: switch to Alerts"
+                if active else
+                "B: START SWEEP  ·  X: switch to Alerts")
+        self.screen.blit(
+            self.font_small.render(hint, True, ORANGE if active else GREY),
+            (8, 48)
+        )
+
+        ROW_H   = 50
+        VISIBLE = 7
+
+        if not sweeps:
+            self.screen.blit(
+                self.font_main.render("No sweeps recorded.", True, GREY),
+                (200, 240)
+            )
+            self.screen.blit(
+                self.font_small.render(
+                    "Press B to begin a sweep. Walk the room. Press B again to end.",
+                    True, (90, 90, 110)
+                ),
+                (50, 274)
+            )
+            self._draw_footer("B:Start Sweep  X:Alerts  Y:Tab")
+            return
+
+        if self.selected >= len(sweeps):
+            self.selected = len(sweeps) - 1
+        if self.selected < self.scroll:
+            self.scroll = self.selected
+        if self.selected >= self.scroll + VISIBLE:
+            self.scroll = self.selected - VISIBLE + 1
+
+        visible = sweeps[self.scroll: self.scroll + VISIBLE]
+        for i, sw in enumerate(visible):
+            y      = 68 + i * ROW_H
+            abs_i  = self.scroll + i
+            is_sel = (abs_i == self.selected)
+
+            row_bg = BG_SEL if is_sel else BG_ROW
+            pygame.draw.rect(self.screen, row_bg, (0, y, 640, ROW_H - 2))
+            stripe = RED if sw["active"] else (LOCKED_COL if sw["watch_hits"] else CYAN)
+            pygame.draw.rect(self.screen, stripe, (0, y, 5, ROW_H - 2))
+
+            start_str = time.strftime("%m-%d %H:%M:%S", time.localtime(sw["start_ts"]))
+            if sw["active"]:
+                dur = max(0, int(time.time() - sw["start_ts"]))
+                dur_str = "ACTIVE"
+            elif sw["end_ts"]:
+                dur = int(sw["end_ts"] - sw["start_ts"])
+                mm, ss = divmod(dur, 60)
+                dur_str = f"{mm}:{ss:02d}"
+            else:
+                # Crashed mid-sweep: no end_ts. Treat duration as unknown.
+                dur_str = "—"
+
+            top_col = WHITE if is_sel else (RED if sw["active"] else GREY)
+            self.screen.blit(
+                self.font_small.render(
+                    f"#{sw['id']}  {start_str}  ({dur_str})",
+                    True, top_col
+                ),
+                (12, y + 4)
+            )
+            phone_col = RED if sw["phones_seen"] else GREY
+            watch_col = LOCKED_COL if sw["watch_hits"] else GREY
+            self.screen.blit(
+                self.font_small.render(
+                    f"{sw['devices_seen']} dev  ·  ", True, GREY
+                ),
+                (12, y + 24)
+            )
+            self.screen.blit(
+                self.font_small.render(
+                    f"{sw['phones_seen']} phones",
+                    True, phone_col
+                ),
+                (130, y + 24)
+            )
+            self.screen.blit(
+                self.font_small.render(
+                    f"  ·  {sw['watch_hits']} watch",
+                    True, watch_col
+                ),
+                (260, y + 24)
+            )
+
+        self._draw_footer("up/dn:Scroll  B:Toggle Sweep  X:Alerts  Y:Tab")
 
     # ── Main render loop ─────────────────────────────────
 

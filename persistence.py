@@ -83,6 +83,39 @@ CREATE TABLE IF NOT EXISTS phone_alerts (
     detail       TEXT              -- JSON for forensic replay
 );
 CREATE INDEX IF NOT EXISTS ix_alerts_ts ON phone_alerts(ts);
+
+-- A "sweep" is an operator-bounded capture window. While a sweep is
+-- active the snapshot loop logs every observation into
+-- sweep_observations so the operator can review just the devices
+-- present during the walk-through, separated from background noise.
+CREATE TABLE IF NOT EXISTS sweeps (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    start_ts     REAL NOT NULL,
+    end_ts       REAL,
+    label        TEXT,
+    devices_seen INTEGER DEFAULT 0,
+    phones_seen  INTEGER DEFAULT 0,
+    watch_hits   INTEGER DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS ix_sweeps_start ON sweeps(start_ts DESC);
+
+CREATE TABLE IF NOT EXISTS sweep_observations (
+    sweep_id   INTEGER NOT NULL,
+    kind       TEXT NOT NULL,    -- 'wifi_ap' | 'wifi_probe' | 'ble'
+    key        TEXT NOT NULL,    -- bssid for AP, fingerprint otherwise
+    label      TEXT,             -- ssid / name / dev_type for human display
+    os         TEXT,
+    dev_type   TEXT,
+    is_phone   INTEGER,
+    is_watch   INTEGER,
+    rssi_max   INTEGER,
+    rssi_last  INTEGER,
+    first_seen REAL,
+    last_seen  REAL,
+    hits       INTEGER DEFAULT 1,
+    PRIMARY KEY (sweep_id, kind, key)
+);
+CREATE INDEX IF NOT EXISTS ix_sweep_obs_sweep ON sweep_observations(sweep_id);
 """
 
 
@@ -100,6 +133,12 @@ class Persistence:
         self._seen_watchlist_fps = set()
         self._alert_queue    = queue.Queue()
 
+        # Active sweep state. Protected by _sweep_lock so the UI thread
+        # can toggle without racing the snapshot thread.
+        self._sweep_lock        = threading.Lock()
+        self._active_sweep      = None     # int sweep_id or None
+        self._active_sweep_ts   = 0.0      # start_ts for the active sweep
+
     def start(self):
         # Open the DB on the background thread to keep sqlite3's
         # check_same_thread happy.
@@ -108,6 +147,10 @@ class Persistence:
         self._thread.start()
 
     def stop(self):
+        # Finalize any sweep that was still active so it gets a real
+        # end_ts / aggregate counts instead of looking crashed.
+        if self.is_sweep_active():
+            self.end_sweep()
         self._running = False
 
     def pop_new_phone_alerts(self):
@@ -119,6 +162,103 @@ class Persistence:
         except queue.Empty:
             pass
         return alerts
+
+    def is_sweep_active(self):
+        with self._sweep_lock:
+            return self._active_sweep is not None
+
+    def active_sweep_id(self):
+        with self._sweep_lock:
+            return self._active_sweep
+
+    def active_sweep_started_at(self):
+        with self._sweep_lock:
+            return self._active_sweep_ts
+
+    def start_sweep(self, label=None):
+        """Open a new sweep. Returns the sweep id. Idempotent — if a
+        sweep is already active the existing id is returned."""
+        with self._sweep_lock:
+            if self._active_sweep is not None:
+                return self._active_sweep
+        start_ts = time.time()
+        try:
+            conn = sqlite3.connect(self._db_path)
+            try:
+                cur = conn.execute(
+                    "INSERT INTO sweeps (start_ts, label) VALUES (?, ?)",
+                    (start_ts, label),
+                )
+                conn.commit()
+                sid = cur.lastrowid
+            finally:
+                conn.close()
+        except Exception as e:
+            print(f"[persistence] start_sweep error: {e}")
+            return None
+        with self._sweep_lock:
+            self._active_sweep    = sid
+            self._active_sweep_ts = start_ts
+        return sid
+
+    def end_sweep(self):
+        """Close the active sweep and roll up its aggregate counts.
+        No-op if no sweep is active."""
+        with self._sweep_lock:
+            sid = self._active_sweep
+            self._active_sweep    = None
+            self._active_sweep_ts = 0.0
+        if sid is None:
+            return
+        try:
+            conn = sqlite3.connect(self._db_path)
+            try:
+                row = conn.execute(
+                    """SELECT COUNT(*),
+                              SUM(CASE WHEN is_phone THEN 1 ELSE 0 END),
+                              SUM(CASE WHEN is_watch THEN 1 ELSE 0 END)
+                         FROM sweep_observations WHERE sweep_id = ?""",
+                    (sid,),
+                ).fetchone()
+                devices, phones, watch = row[0] or 0, row[1] or 0, row[2] or 0
+                conn.execute(
+                    """UPDATE sweeps SET end_ts = ?, devices_seen = ?,
+                                          phones_seen = ?, watch_hits = ?
+                       WHERE id = ?""",
+                    (time.time(), devices, phones, watch, sid),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+        except Exception as e:
+            print(f"[persistence] end_sweep error: {e}")
+
+    def list_sweeps(self, limit=50):
+        try:
+            conn = sqlite3.connect(self._db_path)
+            try:
+                rows = conn.execute(
+                    """SELECT id, start_ts, end_ts, label, devices_seen,
+                              phones_seen, watch_hits
+                         FROM sweeps
+                         ORDER BY start_ts DESC
+                         LIMIT ?""",
+                    (limit,),
+                ).fetchall()
+            finally:
+                conn.close()
+        except Exception:
+            return []
+        active = self.active_sweep_id()
+        return [
+            {
+                "id": r[0], "start_ts": r[1], "end_ts": r[2], "label": r[3],
+                "devices_seen": r[4] or 0, "phones_seen": r[5] or 0,
+                "watch_hits": r[6] or 0,
+                "active": (r[0] == active),
+            }
+            for r in rows
+        ]
 
     def get_recent_alerts(self, limit=50):
         """Read the most recent alerts from disk for the Log tab. Opens a
@@ -163,6 +303,8 @@ class Persistence:
     def _snapshot(self, conn):
         now = time.time()
         cur = conn.cursor()
+        # Read once per snapshot so we don't acquire the sweep lock per-row.
+        sweep_id = self.active_sweep_id()
 
         for ap in self._wifi.get_devices():
             cur.execute(
@@ -194,6 +336,13 @@ class Persistence:
                                   ap.get("ssid"), "Hotspot", "WiFi AP",
                                   ap["rssi"], ap,
                                   seen_set=self._seen_phone_fps)
+            if sweep_id is not None:
+                self._record_observation(
+                    cur, sweep_id, "wifi_ap", ap["bssid"],
+                    label=ap.get("ssid"), os_=None, dev_type=None,
+                    is_phone=ap.get("is_phone"), is_watch=False,
+                    rssi=ap["rssi"], last_seen=ap["last_seen"],
+                )
 
         for pr in self._wifi.get_probes():
             cur.execute(
@@ -235,6 +384,15 @@ class Persistence:
                                   hit_ssid, pr.get("os"), pr.get("dev_type"),
                                   pr["rssi"], pr,
                                   seen_set=self._seen_watchlist_fps)
+            if sweep_id is not None:
+                self._record_observation(
+                    cur, sweep_id, "wifi_probe", pr["fingerprint"],
+                    label=pr.get("ssid"), os_=pr.get("os"),
+                    dev_type=pr.get("dev_type"),
+                    is_phone=pr.get("is_phone"),
+                    is_watch=pr.get("is_watchlisted"),
+                    rssi=pr["rssi"], last_seen=pr["last_seen"],
+                )
 
         for dev in self._ble.get_devices():
             cur.execute(
@@ -257,8 +415,47 @@ class Persistence:
                     dev["rssi"], dev["rssi"], now, dev["last_seen"],
                 ),
             )
+            if sweep_id is not None:
+                # Prefer the stable fingerprint as the sweep key so MAC
+                # rotation collapses inside a sweep too.
+                key = dev.get("fingerprint") or dev["mac"]
+                self._record_observation(
+                    cur, sweep_id, "ble", key,
+                    label=dev.get("name"), os_=None,
+                    dev_type=dev.get("type"),
+                    is_phone=False, is_watch=False,
+                    rssi=dev["rssi"], last_seen=dev["last_seen"],
+                )
 
         conn.commit()
+
+    def _record_observation(self, cur, sweep_id, kind, key, label, os_,
+                            dev_type, is_phone, is_watch, rssi, last_seen):
+        """Upsert a single (sweep, kind, key) observation. Updates rssi_max
+        / rssi_last / last_seen / hits on each call so a row tells the
+        complete story of how that device was seen during the sweep."""
+        cur.execute(
+            """INSERT INTO sweep_observations
+               (sweep_id, kind, key, label, os, dev_type, is_phone, is_watch,
+                rssi_max, rssi_last, first_seen, last_seen, hits)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+               ON CONFLICT(sweep_id, kind, key) DO UPDATE SET
+                   label      = COALESCE(excluded.label, label),
+                   os         = COALESCE(excluded.os, os),
+                   dev_type   = COALESCE(excluded.dev_type, dev_type),
+                   is_phone   = MAX(is_phone, excluded.is_phone),
+                   is_watch   = MAX(is_watch, excluded.is_watch),
+                   rssi_max   = MAX(rssi_max, excluded.rssi_last),
+                   rssi_last  = excluded.rssi_last,
+                   last_seen  = excluded.last_seen,
+                   hits       = hits + 1
+            """,
+            (
+                sweep_id, kind, key, label, os_, dev_type,
+                int(bool(is_phone)), int(bool(is_watch)),
+                rssi, rssi, last_seen, last_seen,
+            ),
+        )
 
     def _maybe_alert(self, conn, kind, fp, mac, ssid, os_, dev_type, rssi, raw, seen_set):
         if not fp or fp in seen_set:
