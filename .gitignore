@@ -5,8 +5,13 @@ __pycache__/
 .venv/
 venv/
 
-# Local capture / logs
+# Local capture / logs / exports
 doperscope.db
 doperscope.db-journal
 *.pcap
 *.log
+sweep_*.csv
+
+# nRF Sniffer firmware archive — vendor-supplied, not redistributable
+tools/firmware/*.zip
+tools/firmware/*.hex
