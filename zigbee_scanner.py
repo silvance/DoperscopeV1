@@ -25,13 +25,18 @@ import time
 #  - 1915:c00a = Nordic nRF Sniffer for 802.15.4 (most common build);
 #    when we see this the dongle is ready to scan and we can launch
 #    `tshark -i nrfsniffer` against it.
+#  - 1915:522a = Nordic nRF Sniffer for Bluetooth LE — different firmware,
+#    different mission. The dongle is flashed and usable, just not for
+#    Zigbee/Thread. The UI calls this out so the operator can decide
+#    whether to reflash for 802.15.4.
 #  - 1915:* (anything else with the Nordic VID) = open bootloader or
 #    some other Nordic firmware; assume the operator still needs to
 #    flash the sniffer firmware before it'll capture.
 #  - 239a:* = Adafruit / open-bootloader enumeration that some
 #    MDBT50Q-CX units ship with; same conclusion as above.
 _LSUSB_LINE = re.compile(r"^Bus \S+ Device \S+: ID (\w{4}):(\w{4})", re.IGNORECASE)
-_SNIFFER_VID_PID = ("1915", "c00a")
+_SNIFFER_802154_VID_PID = ("1915", "c00a")
+_SNIFFER_BLE_VID_PID    = ("1915", "522a")
 _BOOTLOADER_VIDS = ("1915", "239a")
 
 
@@ -46,10 +51,12 @@ class ZigbeeScanner:
 
     def status(self):
         """Return one of:
-          - "absent"     : no nRF52840 dongle on USB at all
-          - "bootloader" : dongle present but firmware is the open bootloader
-                           (or anything other than the sniffer); needs flashing
-          - "sniffer"    : Nordic nRF Sniffer firmware running, ready to capture
+          - "absent"      : no nRF52840 dongle on USB at all
+          - "bootloader"  : dongle present, in open bootloader; needs flashing
+          - "ble_sniffer" : flashed with Nordic nRF Sniffer for Bluetooth LE
+                            (wrong firmware for Zigbee — operator must reflash
+                            with nRF Sniffer for 802.15.4 to capture here)
+          - "sniffer"     : Nordic nRF Sniffer for 802.15.4, ready to capture
         Cached for 5s so the render loop can call this every frame.
         """
         now = time.time()
@@ -63,21 +70,27 @@ class ZigbeeScanner:
             self._status_checked_at = now
             return self._status_cached
 
-        seen_sniffer    = False
-        seen_bootloader = False
+        seen_sniffer     = False
+        seen_ble_sniffer = False
+        seen_bootloader  = False
         for line in lines:
             m = _LSUSB_LINE.match(line)
             if not m:
                 continue
             vid, pid = m.group(1).lower(), m.group(2).lower()
-            if (vid, pid) == _SNIFFER_VID_PID:
+            if (vid, pid) == _SNIFFER_802154_VID_PID:
                 seen_sniffer = True
                 break
+            if (vid, pid) == _SNIFFER_BLE_VID_PID:
+                seen_ble_sniffer = True
+                continue
             if vid in _BOOTLOADER_VIDS:
                 seen_bootloader = True
 
         if seen_sniffer:
             status = "sniffer"
+        elif seen_ble_sniffer:
+            status = "ble_sniffer"
         elif seen_bootloader:
             status = "bootloader"
         else:
@@ -88,8 +101,8 @@ class ZigbeeScanner:
         return status
 
     def is_available(self):
-        """True if a candidate nRF52840 dongle is plugged in (any state)."""
-        return self.status() != "absent"
+        """True if the dongle is flashed with the 802.15.4 sniffer specifically."""
+        return self.status() == "sniffer"
 
     def start(self):
         if self._running:

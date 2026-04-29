@@ -1274,6 +1274,8 @@ class Doperscope:
         devs    = self.zigbee.get_devices() if zstatus == "sniffer" else []
         if zstatus == "sniffer":
             label = "READY"
+        elif zstatus == "ble_sniffer":
+            label = "BLE SNIFFER FW"
         elif zstatus == "bootloader":
             label = "NEEDS FLASH"
         else:
@@ -1326,6 +1328,35 @@ class Doperscope:
             for line in lines:
                 self.screen.blit(self.font_small.render(line, True, GREY), (24, y))
                 y += 26
+            self._draw_footer("Y:Tab")
+            return
+
+        if zstatus == "ble_sniffer":
+            pygame.draw.rect(self.screen, (50, 30, 0), (0, 44, 640, 22))
+            self.screen.blit(
+                self.font_small.render(
+                    "Dongle has nRF Sniffer for Bluetooth LE - reflash for Zigbee.",
+                    True, LOCKED_COL
+                ),
+                (8, 48)
+            )
+            lines = [
+                "Current firmware sniffs BLE link-layer (Wireshark-only, not used",
+                "by Doperscope today). To capture Zigbee/Thread you need to",
+                "reflash with nRF Sniffer for 802.15.4:",
+                "",
+                "1. Drop the 802.15.4 sniffer ZIP at:",
+                "   tools/firmware/nrf_sniffer.zip",
+                "",
+                "2. sudo bash tools/flash_nrf_sniffer.sh",
+                "",
+                "Reflashing is reversible — keep the BLE sniffer ZIP if you",
+                "want to swap back later.",
+            ]
+            y = 90
+            for line in lines:
+                self.screen.blit(self.font_small.render(line, True, GREY), (24, y))
+                y += 22
             self._draw_footer("Y:Tab")
             return
 
