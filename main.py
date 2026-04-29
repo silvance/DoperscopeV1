@@ -1314,15 +1314,15 @@ class Doperscope:
                 (8, 48)
             )
             lines = [
-                "1. Drop nRF Sniffer firmware ZIP at:",
-                "   tools/firmware/nrf_sniffer.zip",
+                "1. Drop the firmware HEX at:",
+                "   tools/firmware/nrf_sniffer.hex",
+                "   (raw HEX from NordicSemiconductor/nRF-Sniffer-for-802.15.4)",
                 "",
-                "2. From the project root, run:",
-                "   sudo bash tools/flash_nrf_sniffer.sh",
+                "2. sudo bash tools/flash_nrf_sniffer.sh",
                 "",
                 "3. After flash, re-plug the dongle and return to this tab.",
                 "",
-                "(See tools/flash_nrf_sniffer.sh --help for details.)",
+                "(.zip DFU package also accepted. See --help for details.)",
             ]
             y = 90
             for line in lines:
@@ -1345,13 +1345,12 @@ class Doperscope:
                 "by Doperscope today). To capture Zigbee/Thread you need to",
                 "reflash with nRF Sniffer for 802.15.4:",
                 "",
-                "1. Drop the 802.15.4 sniffer ZIP at:",
-                "   tools/firmware/nrf_sniffer.zip",
+                "1. Drop the firmware HEX at:",
+                "   tools/firmware/nrf_sniffer.hex",
                 "",
                 "2. sudo bash tools/flash_nrf_sniffer.sh",
                 "",
-                "Reflashing is reversible — keep the BLE sniffer ZIP if you",
-                "want to swap back later.",
+                "Reflashing is reversible if you want to swap back later.",
             ]
             y = 90
             for line in lines:
