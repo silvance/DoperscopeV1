@@ -55,8 +55,23 @@ if [ -z "$FIRMWARE" ] || [ ! -f "$FIRMWARE" ]; then
     exit 1
 fi
 
+# nrfutil is commonly installed per-user via `pip install --user`, which
+# lands in $HOME/.local/bin. Under sudo, $HOME flips to /root and that
+# path falls off PATH, so the binary appears to be missing. Look in the
+# calling user's home (via SUDO_USER) before giving up.
 if ! command -v nrfutil >/dev/null 2>&1; then
-    echo "ERROR: nrfutil not on PATH. Install with: pip install nrfutil" >&2
+    if [ -n "${SUDO_USER:-}" ]; then
+        USER_HOME="$(getent passwd "$SUDO_USER" | cut -d: -f6)"
+        if [ -x "$USER_HOME/.local/bin/nrfutil" ]; then
+            export PATH="$USER_HOME/.local/bin:$PATH"
+        fi
+    fi
+fi
+if ! command -v nrfutil >/dev/null 2>&1; then
+    echo "ERROR: nrfutil not on PATH." >&2
+    echo "  - System-wide install:  sudo pip install nrfutil --break-system-packages" >&2
+    echo "  - User-level install:   pip install nrfutil --break-system-packages" >&2
+    echo "    (then re-run this script — SUDO_USER lookup will find it)" >&2
     exit 1
 fi
 
