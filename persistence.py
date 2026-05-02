@@ -155,6 +155,13 @@ class Persistence:
         self._active_sweep      = None     # int sweep_id or None
         self._active_sweep_ts   = 0.0      # start_ts for the active sweep
 
+        # Tiny TTL cache for read-heavy UI queries (Log tab calls these
+        # every render frame at ~20fps; without caching we'd open and
+        # close ~20 sqlite connections per second per query).
+        self._read_cache       = {}      # name -> (expires_at, value)
+        self._read_cache_lock  = threading.Lock()
+        self._read_cache_ttl_s = 1.0
+
     def start(self):
         # Open the DB on the background thread to keep sqlite3's
         # check_same_thread happy.
@@ -168,6 +175,12 @@ class Persistence:
         if self.is_sweep_active():
             self.end_sweep()
         self._running = False
+        # Wait for the snapshot thread to wake from its sleep and exit
+        # cleanly so the last in-flight transaction commits and the conn
+        # closes; otherwise the daemon thread can be killed mid-sleep on
+        # process exit and lose up to SNAPSHOT_INTERVAL_S of upserts.
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=SNAPSHOT_INTERVAL_S + 1.0)
 
     def pop_new_phone_alerts(self):
         """Return all pending alerts and clear the queue. UI calls this each frame."""
@@ -215,6 +228,7 @@ class Persistence:
         with self._sweep_lock:
             self._active_sweep    = sid
             self._active_sweep_ts = start_ts
+        self.invalidate_read_cache()
         return sid
 
     def end_sweep(self):
@@ -224,6 +238,7 @@ class Persistence:
             sid = self._active_sweep
             self._active_sweep    = None
             self._active_sweep_ts = 0.0
+        self.invalidate_read_cache()
         if sid is None:
             return
         try:
@@ -249,7 +264,28 @@ class Persistence:
         except Exception as e:
             print(f"[persistence] end_sweep error: {e}")
 
+    def _cache_get(self, key):
+        with self._read_cache_lock:
+            entry = self._read_cache.get(key)
+            if entry and entry[0] > time.time():
+                return entry[1]
+        return None
+
+    def _cache_put(self, key, value):
+        with self._read_cache_lock:
+            self._read_cache[key] = (time.time() + self._read_cache_ttl_s, value)
+
+    def invalidate_read_cache(self):
+        """Drop all cached read results — call after start/end_sweep so the
+        UI sees the new state immediately instead of waiting up to 1s."""
+        with self._read_cache_lock:
+            self._read_cache.clear()
+
     def list_sweeps(self, limit=50):
+        cache_key = ("list_sweeps", limit)
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return cached
         try:
             conn = sqlite3.connect(self._db_path)
             try:
@@ -266,7 +302,7 @@ class Persistence:
         except Exception:
             return []
         active = self.active_sweep_id()
-        return [
+        result = [
             {
                 "id": r[0], "start_ts": r[1], "end_ts": r[2], "label": r[3],
                 "devices_seen": r[4] or 0, "phones_seen": r[5] or 0,
@@ -275,6 +311,8 @@ class Persistence:
             }
             for r in rows
         ]
+        self._cache_put(cache_key, result)
+        return result
 
     def get_sweep_observations(self, sweep_id, limit=500):
         """Return every distinct device captured during a sweep, sorted
@@ -383,7 +421,12 @@ class Persistence:
 
     def get_recent_alerts(self, limit=50):
         """Read the most recent alerts from disk for the Log tab. Opens a
-        fresh read-only connection so it's safe to call from the UI thread."""
+        fresh read-only connection so it's safe to call from the UI thread.
+        Result is cached for ~1s to avoid per-frame sqlite churn."""
+        cache_key = ("get_recent_alerts", limit)
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return cached
         try:
             conn = sqlite3.connect(self._db_path)
             try:
@@ -398,13 +441,15 @@ class Persistence:
                 conn.close()
         except Exception:
             return []
-        return [
+        result = [
             {
                 "ts": r[0], "kind": r[1], "fingerprint": r[2], "mac": r[3],
                 "ssid": r[4], "os": r[5], "dev_type": r[6], "rssi": r[7],
             }
             for r in rows
         ]
+        self._cache_put(cache_key, result)
+        return result
 
     def _migrate(self, conn):
         """Drop ble_devices if it has the old MAC-keyed shape. Old rows were

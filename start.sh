@@ -3,8 +3,11 @@
 # 1. Wait for the OS and USB bus to fully settle
 sleep 10
 
-# 2. Kill the built-in Wi-Fi manager so it stops hijacking wlan1
-/usr/bin/killall wpa_supplicant 2>/dev/null || true
+# 2. Kill any wpa_supplicant that's holding wlan1 specifically. The
+#    previous version did `killall wpa_supplicant`, which also killed
+#    the supplicant managing wlan0 (the Pi's onboard Wi-Fi) and broke
+#    its network connection. Scope strictly to wlan1.
+/usr/bin/pkill -f "wpa_supplicant.*wlan1" 2>/dev/null || true
 
 # 3. Clear any soft-blocks
 /usr/sbin/rfkill unblock all

@@ -164,6 +164,10 @@ class BLEScanner:
             traceback.print_exc()
             
     async def _scan(self):
+        # The `async with` block tears the BleakScanner down cleanly when
+        # the while loop exits. Setting self._running = False from another
+        # thread will land on the next sleep tick (≤0.5s), at which point
+        # the scanner context manager runs its __aexit__ and we return.
         async with BleakScanner(self._detection_callback) as scanner:
             while self._running:
                 await asyncio.sleep(0.5)
@@ -171,7 +175,11 @@ class BLEScanner:
     def _run_loop(self):
         self._loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._loop)
-        self._loop.run_until_complete(self._scan())
+        try:
+            self._loop.run_until_complete(self._scan())
+        finally:
+            self._loop.close()
+            self._loop = None
 
     def start(self):
         self._running = True
@@ -179,9 +187,13 @@ class BLEScanner:
         self._thread.start()
 
     def stop(self):
+        # Don't loop.stop() — it would yank the rug while _scan's BleakScanner
+        # is mid-cleanup ("Event loop stopped before Future completed").
+        # Just signal _scan to exit and join the thread; the async-with block
+        # tears the scanner down properly on its own.
         self._running = False
-        if self._loop:
-            self._loop.call_soon_threadsafe(self._loop.stop)
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=2.0)
 
     def get_devices(self, sort_by="rssi"):
         with self._lock:

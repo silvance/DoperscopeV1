@@ -87,13 +87,17 @@ def draw_signal_bars(surface, x, y, rssi, height=20):
 class Doperscope:
     def __init__(self):
         pygame.init()
-        pygame.mixer.init() # ADD THIS
-        # Load a short, sharp tick sound (you'll need to drop a tick.wav in the dir)
+        # Audio is optional — Pis without an audio device (or with the
+        # mixer disabled in raspi-config) raise pygame.error on init.
+        # Degrade gracefully: no tick sound, no banner audio, but the
+        # rest of the UI still runs.
         try:
+            pygame.mixer.init()
             self.tick_sound = pygame.mixer.Sound("tick.wav")
-        except:
+        except Exception as e:
+            print(f"[doperscope] audio disabled ({e})")
             self.tick_sound = None
-        self.last_tick_time = 0 # ADD THIS
+        self.last_tick_time = 0
         self.screen = pygame.display.set_mode((640, 480))
         self.fb     = open("/dev/fb0", "wb")
 
@@ -126,7 +130,7 @@ class Doperscope:
         self.show_probes = True
         self.view        = "ap_list"  # ap_list | client_list | df_mode
 
-        # DF mode state
+        # BLE DF state
         self.ble_df_target  = None
         self.ble_df_history = collections.deque(maxlen=DF_HISTORY)
         self.ble_df_peak    = -100
@@ -138,20 +142,11 @@ class Doperscope:
         self._event_queue = queue.Queue()
 
         # WiFi DF state
-        self.df_history  = collections.deque(maxlen=60)
+        self.df_history  = collections.deque(maxlen=DF_HISTORY)
         self.df_peak     = -100
         self.df_avg      = -100
         self.df_last     = -100
         self.df_trend    = "STEADY"
-
-        # BLE DF state
-        self.ble_df_target  = None
-        self.ble_df_history = collections.deque(maxlen=60)
-        self.ble_df_peak    = -100
-        self.ble_df_avg     = -100
-        self.ble_df_last    = -100
-        self.ble_df_trend   = "STEADY"
-        self.ble_df_missing = False
 
         # Phone DF state — tracks by IE fingerprint so MAC rotation doesn't
         # break the lock during a sweep.
@@ -1272,8 +1267,10 @@ class Doperscope:
     def _draw_zigbee_list(self):
         zstatus = self.zigbee.status()
         devs    = self.zigbee.get_devices() if zstatus == "sniffer" else []
+        # Don't say "READY" while the capture path is stubbed — operators
+        # would assume Zigbee is being captured and miss real intrusions.
         if zstatus == "sniffer":
-            label = "READY"
+            label = "FW OK / NO CAPTURE"
         elif zstatus == "ble_sniffer":
             label = "BLE SNIFFER FW"
         elif zstatus == "bootloader":
@@ -1360,11 +1357,11 @@ class Doperscope:
             return
 
         # zstatus == "sniffer"
-        pygame.draw.rect(self.screen, (8, 30, 30), (0, 44, 640, 22))
+        pygame.draw.rect(self.screen, (50, 30, 0), (0, 44, 640, 22))
         self.screen.blit(
             self.font_small.render(
-                "nRF Sniffer firmware detected. Capture path stubbed - see _run_loop.",
-                True, CYAN
+                "Sniffer firmware OK - but Doperscope's tshark integration is NOT yet active.",
+                True, LOCKED_COL
             ),
             (8, 48)
         )
@@ -1776,7 +1773,12 @@ class Doperscope:
         # Drawn last so it overlays whatever view is active.
         self._draw_alert_banner()
         pygame.display.flip()
-        raw = pygame.image.tostring(self.screen, "BGRA")
+        # tobytes is the modern API; tostring was deprecated in pygame 2.1.3.
+        # Fall back to tostring for older pygame on legacy installs.
+        try:
+            raw = pygame.image.tobytes(self.screen, "BGRA")
+        except AttributeError:
+            raw = pygame.image.tostring(self.screen, "BGRA")
         self.fb.seek(0)
         self.fb.write(raw)
 
