@@ -15,6 +15,14 @@ sleep 10
 /usr/sbin/ip link set wlan1 up
 /usr/sbin/iw dev wlan1 set channel 6
 
-# 5. Launch with unbuffered output (-u) so we can see errors
+# 5. Kill any orphaned main.py from a previous session that's still
+#    holding the Game HAT GPIO pins. lgpio cleanup at the top of main.py
+#    can only release pins claimed by the same process — orphan claims
+#    have to be killed at the OS level. The brief sleep gives the kernel
+#    time to release the GPIO claim before the new process tries to grab.
+/usr/bin/pkill -f "python3 -u main.py" 2>/dev/null || true
+sleep 1
+
+# 6. Launch with unbuffered output (-u) so we can see errors
 cd "$(dirname "$(readlink -f "$0")")"
 /usr/bin/python3 -u main.py

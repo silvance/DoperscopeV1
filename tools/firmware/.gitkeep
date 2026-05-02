@@ -1,0 +1,6 @@
+# Drop the nRF Sniffer for 802.15.4 firmware ZIP at this path:
+#   tools/firmware/nrf_sniffer.zip
+# Then run: sudo bash tools/flash_nrf_sniffer.sh
+#
+# This file just keeps the directory under git so the path exists at
+# clone time. The firmware ZIP itself is excluded by .gitignore.

@@ -1270,12 +1270,19 @@ class Doperscope:
     # ── Zigbee tab ───────────────────────────────────────
 
     def _draw_zigbee_list(self):
-        available = self.zigbee.is_available()
-        devs      = self.zigbee.get_devices() if available else []
-        status    = "PRESENT" if available else "NO DONGLE"
-        self._draw_topbar(right_text=f"{status}  {len(devs)}d")
+        zstatus = self.zigbee.status()
+        devs    = self.zigbee.get_devices() if zstatus == "sniffer" else []
+        if zstatus == "sniffer":
+            label = "READY"
+        elif zstatus == "ble_sniffer":
+            label = "BLE SNIFFER FW"
+        elif zstatus == "bootloader":
+            label = "NEEDS FLASH"
+        else:
+            label = "NO DONGLE"
+        self._draw_topbar(right_text=f"{label}  {len(devs)}d")
 
-        if not available:
+        if zstatus == "absent":
             pygame.draw.rect(self.screen, (40, 8, 8), (0, 44, 640, 22))
             self.screen.blit(
                 self.font_small.render("nRF52840 dongle not detected on USB.", True, ORANGE),
@@ -1284,7 +1291,7 @@ class Doperscope:
             lines = [
                 "Plug in the Raytac MDBT50Q-CX (nRF52840) and re-launch.",
                 "",
-                "When firmware is flashed:",
+                "When the firmware is flashed:",
                 "  - nRF Sniffer for 802.15.4 -> Zigbee/Thread",
                 "  - or Sniffle -> BLE 5 long-range capture",
                 "",
@@ -1297,10 +1304,66 @@ class Doperscope:
             self._draw_footer("Y:Tab")
             return
 
+        if zstatus == "bootloader":
+            pygame.draw.rect(self.screen, (50, 30, 0), (0, 44, 640, 22))
+            self.screen.blit(
+                self.font_small.render(
+                    "Dongle present but in bootloader - flash nRF Sniffer firmware.",
+                    True, LOCKED_COL
+                ),
+                (8, 48)
+            )
+            lines = [
+                "1. Drop the firmware HEX at:",
+                "   tools/firmware/nrf_sniffer.hex",
+                "   (raw HEX from NordicSemiconductor/nRF-Sniffer-for-802.15.4)",
+                "",
+                "2. sudo bash tools/flash_nrf_sniffer.sh",
+                "",
+                "3. After flash, re-plug the dongle and return to this tab.",
+                "",
+                "(.zip DFU package also accepted. See --help for details.)",
+            ]
+            y = 90
+            for line in lines:
+                self.screen.blit(self.font_small.render(line, True, GREY), (24, y))
+                y += 26
+            self._draw_footer("Y:Tab")
+            return
+
+        if zstatus == "ble_sniffer":
+            pygame.draw.rect(self.screen, (50, 30, 0), (0, 44, 640, 22))
+            self.screen.blit(
+                self.font_small.render(
+                    "Dongle has nRF Sniffer for Bluetooth LE - reflash for Zigbee.",
+                    True, LOCKED_COL
+                ),
+                (8, 48)
+            )
+            lines = [
+                "Current firmware sniffs BLE link-layer (Wireshark-only, not used",
+                "by Doperscope today). To capture Zigbee/Thread you need to",
+                "reflash with nRF Sniffer for 802.15.4:",
+                "",
+                "1. Drop the firmware HEX at:",
+                "   tools/firmware/nrf_sniffer.hex",
+                "",
+                "2. sudo bash tools/flash_nrf_sniffer.sh",
+                "",
+                "Reflashing is reversible if you want to swap back later.",
+            ]
+            y = 90
+            for line in lines:
+                self.screen.blit(self.font_small.render(line, True, GREY), (24, y))
+                y += 22
+            self._draw_footer("Y:Tab")
+            return
+
+        # zstatus == "sniffer"
         pygame.draw.rect(self.screen, (8, 30, 30), (0, 44, 640, 22))
         self.screen.blit(
             self.font_small.render(
-                "nRF52840 detected. Scanner stub active - flash sniffer firmware to populate.",
+                "nRF Sniffer firmware detected. Capture path stubbed - see _run_loop.",
                 True, CYAN
             ),
             (8, 48)
