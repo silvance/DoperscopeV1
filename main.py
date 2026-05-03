@@ -128,7 +128,9 @@ class Doperscope:
         self.selected    = 0
         self.scroll      = 0
         self.locked      = None
-        self.show_hidden = True
+        # show_hidden was always True with no toggle wired up — removed
+        # along with the H:ON/OFF topbar lie. show_probes is real (Select
+        # on the WiFi tab toggles it via _toggle_hidden).
         self.show_probes = True
         self.view        = "ap_list"  # ap_list | client_list | df_mode
 
@@ -391,10 +393,7 @@ class Doperscope:
 
     def _get_wifi_devices(self):
         band = None if WIFI_FILTERS[self.wifi_filter] == "ALL" else WIFI_FILTERS[self.wifi_filter]
-        devs = self.scanner.get_devices(band_filter=band, sort_by=SORTS[self.sort_idx])
-        if not self.show_hidden:
-            devs = [d for d in devs if not d["hidden"]]
-        return devs
+        return self.scanner.get_devices(band_filter=band, sort_by=SORTS[self.sort_idx])
 
     def _update_df(self):
         """Update DF mode stats from live scan data."""
@@ -686,9 +685,8 @@ class Doperscope:
         devs       = self._get_wifi_devices()
         filter_str = WIFI_FILTERS[self.wifi_filter]
         sort_str   = SORTS[self.sort_idx].upper()
-        hid_str    = "H:ON" if self.show_hidden else "H:OFF"
         self._draw_topbar(
-            right_text=f"{filter_str}  {sort_str}  {hid_str}  {len(devs)}APs"
+            right_text=f"{filter_str}  {sort_str}  {len(devs)}APs"
         )
 
         pygame.draw.rect(self.screen, (18, 18, 48), (0, 44, 640, 22))

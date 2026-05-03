@@ -196,6 +196,79 @@ class PersistenceSweepTests(unittest.TestCase):
             shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+class PersistenceBLEAlertTests(unittest.TestCase):
+    """The MEDIUM-batch added a BLE alert path so phone-class BLE devices
+    (iPhone / AirPods / Apple Watch / etc.) escalate to the same red
+    banner Wi-Fi probes do. Confirm a phone-class device fires an alert
+    and a non-phone-class one stays quiet."""
+
+    def test_phone_class_ble_device_fires_alert(self):
+        from persistence import SCHEMA
+        p, tmpdir, db_path = _make_persistence({"DOPESCOPE_RETENTION_DAYS": "0"})
+        try:
+            now = time.time()
+            p._ble._devices = [
+                # phone-class — should alert
+                {"name": "Joe's iPhone", "mac": "11:22:33:44:55:66",
+                 "macs": ["11:22:33:44:55:66"], "rssi": -55, "vendor": "Apple",
+                 "type": "iPhone", "fingerprint": "mfr:4c:01..::svc:",
+                 "last_seen": now},
+                # generic BLE — should NOT alert
+                {"name": "Light Bulb", "mac": "aa:bb:cc:dd:ee:ff",
+                 "macs": ["aa:bb:cc:dd:ee:ff"], "rssi": -70, "vendor": "Unknown",
+                 "type": "BLE Device", "fingerprint": "mfr:ff:beef::svc:",
+                 "last_seen": now},
+            ]
+            os.makedirs(tmpdir, mode=0o700, exist_ok=True)
+            conn = sqlite3.connect(db_path)
+            conn.executescript(SCHEMA); conn.commit()
+            p._snapshot(conn)
+            conn.close()
+
+            alerts = p.get_recent_alerts()
+            ble_alerts = [a for a in alerts if a["kind"] == "ble"]
+            self.assertEqual(len(ble_alerts), 1, "expected exactly 1 BLE alert (the iPhone)")
+            self.assertEqual(ble_alerts[0]["dev_type"], "iPhone")
+            self.assertEqual(ble_alerts[0]["mac"], "11:22:33:44:55:66")
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+class PersistenceFaultIsolationTests(unittest.TestCase):
+    """The MEDIUM-batch wrapped each device upsert in its own try/except so
+    one malformed row doesn't roll back the whole snapshot. Confirm a
+    deliberately-broken probe doesn't take down a sibling AP."""
+
+    def test_one_bad_probe_doesnt_lose_the_good_ap(self):
+        from persistence import SCHEMA
+        p, tmpdir, db_path = _make_persistence({"DOPESCOPE_RETENTION_DAYS": "0"})
+        try:
+            now = time.time()
+            p._wifi._devices = [{
+                "bssid": "aa:bb:cc:dd:ee:ff", "ssid": "GoodAP", "channel": 6,
+                "band": "2.4G", "vendor": "X", "hidden": False, "is_phone": False,
+                "rssi": -55, "last_seen": now,
+            }]
+            # Probe missing required keys (no rssi, no last_seen) — will
+            # raise inside the upsert and should be skipped silently.
+            p._wifi._probes = [{
+                "fingerprint": "ie:bad",
+                # missing mac, missing rssi, missing last_seen
+            }]
+            os.makedirs(tmpdir, mode=0o700, exist_ok=True)
+            conn = sqlite3.connect(db_path)
+            conn.executescript(SCHEMA); conn.commit()
+            p._snapshot(conn)
+
+            aps = conn.execute("SELECT ssid FROM wifi_aps").fetchall()
+            probes = conn.execute("SELECT fingerprint FROM wifi_probes").fetchall()
+            conn.close()
+            self.assertEqual(aps, [("GoodAP",)], "good AP should still be persisted")
+            self.assertEqual(probes, [], "bad probe should have been skipped")
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 class PersistenceCacheTests(unittest.TestCase):
     def test_repeat_read_hits_cache(self):
         p, tmpdir, db_path = _make_persistence()

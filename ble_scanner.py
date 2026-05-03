@@ -91,7 +91,13 @@ class BLEScanner:
         self.last_packet_ts = 0.0
 
     def _get_fingerprint(self, name, mfr_data, services):
-        """Creates a unique signature to track devices through MAC rotations."""
+        """Stable signature used to track devices through MAC rotations.
+        Composed of manufacturer data + service UUIDs only. The device
+        name is intentionally excluded — users rename their AirPods,
+        Apple Watch, etc., and a rename shouldn't fork tracking into
+        two ghosts. The trivial-fingerprint sentinel
+        (no mfr + no services) is still preserved by including the
+        empty-string structure so _is_trivial_fp's check still matches."""
         mfr_str = ""
         if mfr_data:
             for k, v in sorted(mfr_data.items()):
@@ -101,19 +107,17 @@ class BLEScanner:
                 except Exception:
                     pass
         svc_str = ",".join(sorted(services))
-        return f"{name}::{mfr_str}::{svc_str}"
+        return f"mfr:{mfr_str}::svc:{svc_str}"
 
     @staticmethod
     def _is_trivial_fp(name, mfr_data, services):
-        """A fingerprint is trivial if it carries no real signal — no
-        manufacturer data, no services, no usable name. Many unrelated
-        devices would collapse into one bucket if we keyed by it, so we
-        fall back to keying by MAC for those."""
-        if mfr_data:
-            return False
-        if services:
-            return False
-        return not name or name == "[unnamed]"
+        """A fingerprint is trivial when neither manufacturer data nor
+        services are present. We used to also check name, but the
+        fingerprint formula no longer includes it (users rename their
+        devices), so any name-only differentiation between devices
+        would collide on the same fingerprint string. Trivial entries
+        are keyed by MAC so they don't collapse together."""
+        return not mfr_data and not services
 
     def _detection_callback(self, device, advertisement_data):
         try:

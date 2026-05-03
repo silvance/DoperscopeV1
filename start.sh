@@ -31,8 +31,11 @@ fi
 # 2. Kill any wpa_supplicant that's holding $WIFI_IFACE specifically.
 #    The previous version did `killall wpa_supplicant`, which also
 #    killed the supplicant managing wlan0 (the Pi's onboard Wi-Fi)
-#    and broke its network connection.
-/usr/bin/pkill -f "wpa_supplicant.*${WIFI_IFACE}" 2>/dev/null || true
+#    and broke its network connection. The regex requires the iface
+#    appear as an `-i wlanX` argument so we don't accidentally match
+#    unrelated processes whose cmdline happens to contain both
+#    "wpa_supplicant" and "wlan1" as substrings.
+/usr/bin/pkill -f "wpa_supplicant.*-i[[:space:]]*${WIFI_IFACE}\b" 2>/dev/null || true
 
 # 3. Clear any soft-blocks
 /usr/sbin/rfkill unblock all
