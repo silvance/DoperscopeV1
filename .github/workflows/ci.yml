@@ -1,0 +1,38 @@
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # Match the Pi 4B's stock interpreter on Bookworm + the
+        # most-likely upgrade target.
+        python-version: ["3.11", "3.13"]
+      fail-fast: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # Hardware-touching modules (gpiozero, lgpio, scapy, bleak, pygame)
+      # don't install cleanly on a vanilla CI runner, and most won't import
+      # without their corresponding hardware/SDL anyway. The tests we run
+      # in CI deliberately stick to modules that are stdlib-only or
+      # mockable (persistence + zigbee_scanner). Hardware integration
+      # is verified on the Pi by the operator.
+
+      - name: Syntax check stdlib-only modules
+        run: |
+          python -m py_compile persistence.py zigbee_scanner.py input_handler.py
+
+      - name: Run unit tests
+        run: |
+          python -m unittest discover -s tests -v

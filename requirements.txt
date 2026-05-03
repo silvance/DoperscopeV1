@@ -1,5 +1,15 @@
-pygame>=2.5
-gpiozero>=2.0
-lgpio>=0.2
-scapy>=2.5
-bleak>=0.21
+# Compatible-release pinning (~=) — patch upgrades are accepted, minor
+# bumps require an explicit edit. Tested on the Pi 4B that this branch
+# targets; bump intentionally if upstream drops a fix you want.
+#
+# For strict reproducibility on a deployment image, regenerate with:
+#   pip freeze --exclude-editable > requirements-lock.txt
+# and install via `pip install -r requirements-lock.txt`.
+pygame~=2.6
+gpiozero~=2.0
+lgpio~=0.2
+scapy~=2.5
+bleak~=0.21
+# nrfutil is only needed for tools/flash_nrf_sniffer.sh; not imported by
+# any runtime module. Pin lazily — operator installs it on demand.
+# nrfutil~=5.2

@@ -1,19 +1,50 @@
 #!/bin/bash
 
+# Wi-Fi monitor adapter. Override at deploy time:
+#   DOPESCOPE_WIFI_IFACE=wlan2 sudo bash start.sh
+WIFI_IFACE="${DOPESCOPE_WIFI_IFACE:-wlan1}"
+export DOPESCOPE_WIFI_IFACE="$WIFI_IFACE"
+
 # 1. Wait for the OS and USB bus to fully settle
 sleep 10
 
-# 2. Kill the built-in Wi-Fi manager so it stops hijacking wlan1
-/usr/bin/killall wpa_supplicant 2>/dev/null || true
+# 1b. Warn (don't block) if NetworkManager is managing the scan
+#     interface. NM aggressively reclaims interfaces it considers its
+#     own, which silently drops them out of monitor mode mid-sweep.
+#     The fix is to mark $WIFI_IFACE unmanaged in NM's config; we
+#     don't apply that automatically since it persists across reboots
+#     and the operator may want to keep their config under their own
+#     control.
+if command -v nmcli >/dev/null 2>&1; then
+    if nmcli -t -f DEVICE,STATE device 2>/dev/null \
+        | grep -E "^${WIFI_IFACE}:(connected|connecting|disconnected)" >/dev/null; then
+        echo "WARNING: NetworkManager is managing $WIFI_IFACE."
+        echo "  It will reclaim the interface mid-scan and drop monitor mode."
+        echo "  To fix permanently, append to /etc/NetworkManager/NetworkManager.conf:"
+        echo "    [keyfile]"
+        echo "    unmanaged-devices=interface-name:$WIFI_IFACE"
+        echo "  Then: sudo systemctl restart NetworkManager"
+        echo "  Continuing — sweeps may be unreliable until that's set."
+    fi
+fi
+
+# 2. Kill any wpa_supplicant that's holding $WIFI_IFACE specifically.
+#    The previous version did `killall wpa_supplicant`, which also
+#    killed the supplicant managing wlan0 (the Pi's onboard Wi-Fi)
+#    and broke its network connection. The regex requires the iface
+#    appear as an `-i wlanX` argument so we don't accidentally match
+#    unrelated processes whose cmdline happens to contain both
+#    "wpa_supplicant" and "wlan1" as substrings.
+/usr/bin/pkill -f "wpa_supplicant.*-i[[:space:]]*${WIFI_IFACE}\b" 2>/dev/null || true
 
 # 3. Clear any soft-blocks
 /usr/sbin/rfkill unblock all
 
 # 4. Force monitor mode and PRIME THE CHANNEL
-/usr/sbin/ip link set wlan1 down
-/usr/sbin/iw dev wlan1 set type monitor
-/usr/sbin/ip link set wlan1 up
-/usr/sbin/iw dev wlan1 set channel 6
+/usr/sbin/ip link set "$WIFI_IFACE" down
+/usr/sbin/iw dev "$WIFI_IFACE" set type monitor
+/usr/sbin/ip link set "$WIFI_IFACE" up
+/usr/sbin/iw dev "$WIFI_IFACE" set channel 6
 
 # 5. Kill any orphaned main.py from a previous session that's still
 #    holding the Game HAT GPIO pins. lgpio cleanup at the top of main.py

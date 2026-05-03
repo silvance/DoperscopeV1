@@ -16,13 +16,71 @@ import sqlite3
 import threading
 import time
 
-DEFAULT_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "doperscope.db")
+# DB lives in the operator's home directory by default — the previous
+# default put it next to source code, which is a SCIF-hostile place
+# for sensitive sweep data. Override with DOPESCOPE_DB_PATH.
+DEFAULT_DATA_DIR = os.environ.get(
+    "DOPESCOPE_DATA_DIR",
+    os.path.expanduser("~/.doperscope"),
+)
+DEFAULT_DB_PATH = os.environ.get(
+    "DOPESCOPE_DB_PATH",
+    os.path.join(DEFAULT_DATA_DIR, "doperscope.db"),
+)
+DEFAULT_EXPORT_DIR = os.environ.get(
+    "DOPESCOPE_EXPORT_DIR",
+    os.path.join(DEFAULT_DATA_DIR, "exports"),
+)
 SNAPSHOT_INTERVAL_S = 5.0
 
+# Drop rows older than this on every startup. 0 disables retention
+# (keep forever — useful for forensic deployments). Default 30 days
+# is plenty for SCIF post-sweep review without growing a 1GB DB on
+# the SD card over a year of operation.
+RETENTION_DAYS = float(os.environ.get("DOPESCOPE_RETENTION_DAYS", "30"))
+
+# Default busy timeout for every sqlite3 connection in this module.
+# Without this, two concurrent writers (snapshot thread + UI thread
+# calling start_sweep / end_sweep / export) can race and the loser
+# raises "database is locked" instantly. 5s is well above the longest
+# transaction we run, so locks resolve invisibly under contention.
+SQLITE_BUSY_TIMEOUT_MS = 5000
+
+
+def _connect(db_path):
+    """sqlite3.connect with our standard busy_timeout applied. Use this
+    everywhere instead of bare sqlite3.connect so writers never silently
+    drop transactions on lock contention."""
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
+    except Exception:
+        pass
+    return conn
+
+
+def _ensure_private_dir(path):
+    """mkdir -p with mode 0700 — sweep data and watchlists are sensitive."""
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    try:
+        os.chmod(path, 0o700)
+    except OSError:
+        pass
+
+
+def _ensure_private_file(path):
+    """chmod the file 0600 if it exists. No-op on fresh creates; called
+    after sqlite3.connect so the file definitely exists."""
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
 # An in-memory BLE entry with this fingerprint string is "trivial" — no
-# manufacturer data, no services, no usable name. The scanner keeps these
-# per-MAC; persistence does the same to keep them from collapsing.
-_TRIVIAL_BLE_FP = "[unnamed]::::"
+# manufacturer data and no services (the new BLE fingerprint format
+# omits name on purpose since users rename devices). The scanner keeps
+# these per-MAC; persistence does the same to keep them from collapsing.
+_TRIVIAL_BLE_FP = "mfr:::svc:"
 
 def _ble_storage_key(fingerprint, mac):
     if not fingerprint or fingerprint == _TRIVIAL_BLE_FP:
@@ -155,6 +213,13 @@ class Persistence:
         self._active_sweep      = None     # int sweep_id or None
         self._active_sweep_ts   = 0.0      # start_ts for the active sweep
 
+        # Tiny TTL cache for read-heavy UI queries (Log tab calls these
+        # every render frame at ~20fps; without caching we'd open and
+        # close ~20 sqlite connections per second per query).
+        self._read_cache       = {}      # name -> (expires_at, value)
+        self._read_cache_lock  = threading.Lock()
+        self._read_cache_ttl_s = 1.0
+
     def start(self):
         # Open the DB on the background thread to keep sqlite3's
         # check_same_thread happy.
@@ -168,6 +233,12 @@ class Persistence:
         if self.is_sweep_active():
             self.end_sweep()
         self._running = False
+        # Wait for the snapshot thread to wake from its sleep and exit
+        # cleanly so the last in-flight transaction commits and the conn
+        # closes; otherwise the daemon thread can be killed mid-sleep on
+        # process exit and lose up to SNAPSHOT_INTERVAL_S of upserts.
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=SNAPSHOT_INTERVAL_S + 1.0)
 
     def pop_new_phone_alerts(self):
         """Return all pending alerts and clear the queue. UI calls this each frame."""
@@ -199,7 +270,7 @@ class Persistence:
                 return self._active_sweep
         start_ts = time.time()
         try:
-            conn = sqlite3.connect(self._db_path)
+            conn = _connect(self._db_path)
             try:
                 cur = conn.execute(
                     "INSERT INTO sweeps (start_ts, label) VALUES (?, ?)",
@@ -215,6 +286,7 @@ class Persistence:
         with self._sweep_lock:
             self._active_sweep    = sid
             self._active_sweep_ts = start_ts
+        self.invalidate_read_cache()
         return sid
 
     def end_sweep(self):
@@ -224,10 +296,11 @@ class Persistence:
             sid = self._active_sweep
             self._active_sweep    = None
             self._active_sweep_ts = 0.0
+        self.invalidate_read_cache()
         if sid is None:
             return
         try:
-            conn = sqlite3.connect(self._db_path)
+            conn = _connect(self._db_path)
             try:
                 row = conn.execute(
                     """SELECT COUNT(*),
@@ -249,9 +322,30 @@ class Persistence:
         except Exception as e:
             print(f"[persistence] end_sweep error: {e}")
 
+    def _cache_get(self, key):
+        with self._read_cache_lock:
+            entry = self._read_cache.get(key)
+            if entry and entry[0] > time.time():
+                return entry[1]
+        return None
+
+    def _cache_put(self, key, value):
+        with self._read_cache_lock:
+            self._read_cache[key] = (time.time() + self._read_cache_ttl_s, value)
+
+    def invalidate_read_cache(self):
+        """Drop all cached read results — call after start/end_sweep so the
+        UI sees the new state immediately instead of waiting up to 1s."""
+        with self._read_cache_lock:
+            self._read_cache.clear()
+
     def list_sweeps(self, limit=50):
+        cache_key = ("list_sweeps", limit)
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return cached
         try:
-            conn = sqlite3.connect(self._db_path)
+            conn = _connect(self._db_path)
             try:
                 rows = conn.execute(
                     """SELECT id, start_ts, end_ts, label, devices_seen,
@@ -266,7 +360,7 @@ class Persistence:
         except Exception:
             return []
         active = self.active_sweep_id()
-        return [
+        result = [
             {
                 "id": r[0], "start_ts": r[1], "end_ts": r[2], "label": r[3],
                 "devices_seen": r[4] or 0, "phones_seen": r[5] or 0,
@@ -275,13 +369,15 @@ class Persistence:
             }
             for r in rows
         ]
+        self._cache_put(cache_key, result)
+        return result
 
     def get_sweep_observations(self, sweep_id, limit=500):
         """Return every distinct device captured during a sweep, sorted
         watchlist-first, then phones, then by max RSSI seen during the
         capture window."""
         try:
-            conn = sqlite3.connect(self._db_path)
+            conn = _connect(self._db_path)
             try:
                 rows = conn.execute(
                     """SELECT kind, key, label, os, dev_type, is_phone, is_watch,
@@ -309,18 +405,18 @@ class Persistence:
         ]
 
     def export_sweep_csv(self, sweep_id, dest_dir=None):
-        """Dump a sweep + every observation to a CSV next to the DB so the
-        operator can pull the SD card and read it without sqlite3 on the
-        receiving box. Returns the absolute path written, or None on
-        failure (missing sweep, IO error)."""
+        """Dump a sweep + every observation to a CSV under ~/.doperscope/exports
+        (or DOPESCOPE_EXPORT_DIR) so the operator can pull the SD card and read
+        it without sqlite3 on the receiving box. Returns the absolute path
+        written, or None on failure (missing sweep, IO error)."""
         sweep = self.get_sweep(sweep_id)
         if not sweep:
             return None
         observations = self.get_sweep_observations(sweep_id, limit=10_000)
         if dest_dir is None:
-            dest_dir = os.path.dirname(os.path.abspath(self._db_path))
+            dest_dir = DEFAULT_EXPORT_DIR
         try:
-            os.makedirs(dest_dir, exist_ok=True)
+            _ensure_private_dir(dest_dir)
         except Exception:
             return None
         # Use the sweep's start time in the filename so multiple exports
@@ -355,12 +451,13 @@ class Persistence:
         except Exception as e:
             print(f"[persistence] export_sweep_csv error: {e}")
             return None
+        _ensure_private_file(path)
         return path
 
     def get_sweep(self, sweep_id):
         """Fetch a single sweep header row by id."""
         try:
-            conn = sqlite3.connect(self._db_path)
+            conn = _connect(self._db_path)
             try:
                 r = conn.execute(
                     """SELECT id, start_ts, end_ts, label, devices_seen,
@@ -383,9 +480,14 @@ class Persistence:
 
     def get_recent_alerts(self, limit=50):
         """Read the most recent alerts from disk for the Log tab. Opens a
-        fresh read-only connection so it's safe to call from the UI thread."""
+        fresh read-only connection so it's safe to call from the UI thread.
+        Result is cached for ~1s to avoid per-frame sqlite churn."""
+        cache_key = ("get_recent_alerts", limit)
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return cached
         try:
-            conn = sqlite3.connect(self._db_path)
+            conn = _connect(self._db_path)
             try:
                 rows = conn.execute(
                     """SELECT ts, kind, fingerprint, mac, ssid, os, dev_type, rssi
@@ -398,13 +500,15 @@ class Persistence:
                 conn.close()
         except Exception:
             return []
-        return [
+        result = [
             {
                 "ts": r[0], "kind": r[1], "fingerprint": r[2], "mac": r[3],
                 "ssid": r[4], "os": r[5], "dev_type": r[6], "rssi": r[7],
             }
             for r in rows
         ]
+        self._cache_put(cache_key, result)
+        return result
 
     def _migrate(self, conn):
         """Drop ble_devices if it has the old MAC-keyed shape. Old rows were
@@ -420,12 +524,58 @@ class Persistence:
             conn.execute("DROP TABLE ble_devices")
             conn.commit()
 
+    def _retention_sweep(self, conn):
+        """Drop rows older than RETENTION_DAYS so the SD card doesn't fill
+        over months of operation. Skipped entirely when retention is 0
+        (forensic mode — keep everything)."""
+        if RETENTION_DAYS <= 0:
+            return
+        cutoff = time.time() - RETENTION_DAYS * 86400
+        # Order matters: prune children before parents so the sweeps row
+        # itself can be dropped only after its observations are gone.
+        plans = [
+            ("DELETE FROM phone_alerts        WHERE ts        < ?", "phone_alerts"),
+            ("DELETE FROM wifi_aps            WHERE last_seen < ?", "wifi_aps"),
+            ("DELETE FROM wifi_probes         WHERE last_seen < ?", "wifi_probes"),
+            ("DELETE FROM ble_devices         WHERE last_seen < ?", "ble_devices"),
+            ("DELETE FROM sweep_observations  WHERE last_seen < ?", "sweep_observations"),
+            ("DELETE FROM sweeps              WHERE start_ts  < ?", "sweeps"),
+        ]
+        total = 0
+        for sql, tbl in plans:
+            try:
+                cur = conn.execute(sql, (cutoff,))
+                if cur.rowcount and cur.rowcount > 0:
+                    total += cur.rowcount
+            except Exception as e:
+                print(f"[persistence] retention skip {tbl}: {e}")
+        conn.commit()
+        if total:
+            print(f"[persistence] retention: pruned {total} rows older than {RETENTION_DAYS} days")
+
     def _loop(self):
-        conn = sqlite3.connect(self._db_path)
+        # Ensure the data dir exists with private perms BEFORE sqlite3
+        # creates the DB file there. Otherwise the DB lands with whatever
+        # umask the parent process has.
+        _ensure_private_dir(os.path.dirname(os.path.abspath(self._db_path)))
+        conn = _connect(self._db_path)
+        _ensure_private_file(self._db_path)
+        # WAL + synchronous=NORMAL drastically cuts SD-card write
+        # amplification: instead of a full-DB fsync per snapshot we get
+        # one append + a periodic checkpoint. Capture data is recoverable
+        # if power drops mid-write — losing a few seconds of beacons isn't
+        # worth grinding the SD card to dust over a year of operation.
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+        except Exception as e:
+            print(f"[persistence] WAL setup failed (continuing in default mode): {e}")
         try:
             self._migrate(conn)
             conn.executescript(SCHEMA)
             conn.commit()
+            self._retention_sweep(conn)
+            print(f"[persistence] db: {self._db_path}")
             while self._running:
                 try:
                     self._snapshot(conn)
@@ -436,139 +586,181 @@ class Persistence:
         finally:
             conn.close()
 
+    # BLE device types that we treat as "phone-class" — any of these on
+    # an unauthorized BLE radio in a SCIF should alert. iBeacon is
+    # excluded (advertised by lots of non-phone things). Match the
+    # strings classify_device() in ble_scanner.py emits.
+    _BLE_PHONE_TYPES = {
+        "iPhone", "Apple Watch", "MacBook", "AirPods", "AirDrop", "AirTag",
+        "Apple Device", "Android Device", "Samsung Device",
+        "Microsoft Device", "Google Device",
+    }
+
+    def _ble_is_phone(self, dev):
+        return dev.get("type") in self._BLE_PHONE_TYPES
+
     def _snapshot(self, conn):
         now = time.time()
         cur = conn.cursor()
         # Read once per snapshot so we don't acquire the sweep lock per-row.
         sweep_id = self.active_sweep_id()
+        # Per-device try/except below so one bad row (malformed dict,
+        # surprise None where we expected an int) doesn't roll back the
+        # whole snapshot. We commit at the end regardless of partial
+        # failures so successful upserts persist.
+        skipped = 0
 
         for ap in self._wifi.get_devices():
-            cur.execute(
-                """
-                INSERT INTO wifi_aps (bssid, ssid, channel, band, vendor, hidden, is_phone,
-                                      rssi_last, rssi_max, first_seen, last_seen, hits)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
-                ON CONFLICT(bssid) DO UPDATE SET
-                    ssid      = excluded.ssid,
-                    channel   = excluded.channel,
-                    band      = excluded.band,
-                    vendor    = excluded.vendor,
-                    hidden    = excluded.hidden,
-                    is_phone  = excluded.is_phone,
-                    rssi_last = excluded.rssi_last,
-                    rssi_max  = MAX(rssi_max, excluded.rssi_last),
-                    last_seen = excluded.last_seen,
-                    hits      = hits + 1
-                """,
-                (
-                    ap["bssid"], ap.get("ssid"), ap.get("channel"), ap.get("band"),
-                    ap.get("vendor"), int(ap.get("hidden", False)),
-                    int(ap.get("is_phone", False)),
-                    ap["rssi"], ap["rssi"], now, ap["last_seen"],
-                ),
-            )
-            if ap.get("is_phone"):
-                self._maybe_alert(conn, "wifi_ap", ap.get("bssid"), ap.get("bssid"),
-                                  ap.get("ssid"), "Hotspot", "WiFi AP",
-                                  ap["rssi"], ap,
-                                  seen_set=self._seen_phone_fps)
-            if sweep_id is not None:
-                self._record_observation(
-                    cur, sweep_id, "wifi_ap", ap["bssid"],
-                    label=ap.get("ssid"), os_=None, dev_type=None,
-                    is_phone=ap.get("is_phone"), is_watch=False,
-                    rssi=ap["rssi"], last_seen=ap["last_seen"],
+            try:
+                cur.execute(
+                    """
+                    INSERT INTO wifi_aps (bssid, ssid, channel, band, vendor, hidden, is_phone,
+                                          rssi_last, rssi_max, first_seen, last_seen, hits)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+                    ON CONFLICT(bssid) DO UPDATE SET
+                        ssid      = excluded.ssid,
+                        channel   = excluded.channel,
+                        band      = excluded.band,
+                        vendor    = excluded.vendor,
+                        hidden    = excluded.hidden,
+                        is_phone  = excluded.is_phone,
+                        rssi_last = excluded.rssi_last,
+                        rssi_max  = MAX(rssi_max, excluded.rssi_last),
+                        last_seen = excluded.last_seen,
+                        hits      = hits + 1
+                    """,
+                    (
+                        ap["bssid"], ap.get("ssid"), ap.get("channel"), ap.get("band"),
+                        ap.get("vendor"), int(ap.get("hidden", False)),
+                        int(ap.get("is_phone", False)),
+                        ap["rssi"], ap["rssi"], now, ap["last_seen"],
+                    ),
                 )
+                if ap.get("is_phone"):
+                    self._maybe_alert(conn, "wifi_ap", ap.get("bssid"), ap.get("bssid"),
+                                      ap.get("ssid"), "Hotspot", "WiFi AP",
+                                      ap["rssi"], ap,
+                                      seen_set=self._seen_phone_fps)
+                if sweep_id is not None:
+                    self._record_observation(
+                        cur, sweep_id, "wifi_ap", ap["bssid"],
+                        label=ap.get("ssid"), os_=None, dev_type=None,
+                        is_phone=ap.get("is_phone"), is_watch=False,
+                        rssi=ap["rssi"], last_seen=ap["last_seen"],
+                    )
+            except Exception as e:
+                skipped += 1
+                print(f"[persistence] skipping ap row ({ap.get('bssid')}): {e}")
 
         for pr in self._wifi.get_probes():
-            cur.execute(
-                """
-                INSERT INTO wifi_probes (fingerprint, mac_last, macs, ssids_seen,
-                                         os, dev_type, wifi_gen, vendor, is_phone,
-                                         rssi_last, rssi_max, first_seen, last_seen, hits)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(fingerprint) DO UPDATE SET
-                    mac_last   = excluded.mac_last,
-                    macs       = excluded.macs,
-                    ssids_seen = excluded.ssids_seen,
-                    rssi_last  = excluded.rssi_last,
-                    rssi_max   = MAX(rssi_max, excluded.rssi_last),
-                    last_seen  = excluded.last_seen,
-                    hits       = excluded.hits
-                """,
-                (
-                    pr["fingerprint"], pr["mac"],
-                    json.dumps(pr.get("macs", [])),
-                    json.dumps(pr.get("ssids_seen", [])),
-                    pr.get("os"), pr.get("dev_type"), pr.get("wifi_gen"),
-                    pr.get("vendor"), int(pr.get("is_phone", False)),
-                    pr["rssi"], pr["rssi"],
-                    pr.get("first_seen", now), pr["last_seen"], pr.get("hits", 1),
-                ),
-            )
-            if pr.get("is_phone"):
-                self._maybe_alert(conn, "wifi_probe", pr["fingerprint"], pr["mac"],
-                                  pr.get("ssid"), pr.get("os"), pr.get("dev_type"),
-                                  pr["rssi"], pr,
-                                  seen_set=self._seen_phone_fps)
-            if pr.get("is_watchlisted"):
-                # Surface the matched watchlist SSID, not the most recent
-                # ssid value, since that's the actual operational signal.
-                matched = pr.get("matched_ssids") or []
-                hit_ssid = matched[0] if matched else pr.get("ssid")
-                self._maybe_alert(conn, "watchlist", pr["fingerprint"], pr["mac"],
-                                  hit_ssid, pr.get("os"), pr.get("dev_type"),
-                                  pr["rssi"], pr,
-                                  seen_set=self._seen_watchlist_fps)
-            if sweep_id is not None:
-                self._record_observation(
-                    cur, sweep_id, "wifi_probe", pr["fingerprint"],
-                    label=pr.get("ssid"), os_=pr.get("os"),
-                    dev_type=pr.get("dev_type"),
-                    is_phone=pr.get("is_phone"),
-                    is_watch=pr.get("is_watchlisted"),
-                    rssi=pr["rssi"], last_seen=pr["last_seen"],
+            try:
+                cur.execute(
+                    """
+                    INSERT INTO wifi_probes (fingerprint, mac_last, macs, ssids_seen,
+                                             os, dev_type, wifi_gen, vendor, is_phone,
+                                             rssi_last, rssi_max, first_seen, last_seen, hits)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(fingerprint) DO UPDATE SET
+                        mac_last   = excluded.mac_last,
+                        macs       = excluded.macs,
+                        ssids_seen = excluded.ssids_seen,
+                        rssi_last  = excluded.rssi_last,
+                        rssi_max   = MAX(rssi_max, excluded.rssi_last),
+                        last_seen  = excluded.last_seen,
+                        hits       = excluded.hits
+                    """,
+                    (
+                        pr["fingerprint"], pr["mac"],
+                        json.dumps(pr.get("macs", [])),
+                        json.dumps(pr.get("ssids_seen", [])),
+                        pr.get("os"), pr.get("dev_type"), pr.get("wifi_gen"),
+                        pr.get("vendor"), int(pr.get("is_phone", False)),
+                        pr["rssi"], pr["rssi"],
+                        pr.get("first_seen", now), pr["last_seen"], pr.get("hits", 1),
+                    ),
                 )
+                if pr.get("is_phone"):
+                    self._maybe_alert(conn, "wifi_probe", pr["fingerprint"], pr["mac"],
+                                      pr.get("ssid"), pr.get("os"), pr.get("dev_type"),
+                                      pr["rssi"], pr,
+                                      seen_set=self._seen_phone_fps)
+                if pr.get("is_watchlisted"):
+                    # Surface the matched watchlist SSID, not the most recent
+                    # ssid value, since that's the actual operational signal.
+                    matched = pr.get("matched_ssids") or []
+                    hit_ssid = matched[0] if matched else pr.get("ssid")
+                    self._maybe_alert(conn, "watchlist", pr["fingerprint"], pr["mac"],
+                                      hit_ssid, pr.get("os"), pr.get("dev_type"),
+                                      pr["rssi"], pr,
+                                      seen_set=self._seen_watchlist_fps)
+                if sweep_id is not None:
+                    self._record_observation(
+                        cur, sweep_id, "wifi_probe", pr["fingerprint"],
+                        label=pr.get("ssid"), os_=pr.get("os"),
+                        dev_type=pr.get("dev_type"),
+                        is_phone=pr.get("is_phone"),
+                        is_watch=pr.get("is_watchlisted"),
+                        rssi=pr["rssi"], last_seen=pr["last_seen"],
+                    )
+            except Exception as e:
+                skipped += 1
+                print(f"[persistence] skipping probe row ({pr.get('fingerprint')}): {e}")
 
         for dev in self._ble.get_devices():
-            ble_key = _ble_storage_key(dev.get("fingerprint"), dev["mac"])
-            cur.execute(
-                """
-                INSERT INTO ble_devices (key, fingerprint, mac_last, macs, name,
-                                         vendor, dev_type, rssi_last, rssi_max,
-                                         first_seen, last_seen, hits)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
-                ON CONFLICT(key) DO UPDATE SET
-                    fingerprint = excluded.fingerprint,
-                    mac_last    = excluded.mac_last,
-                    macs        = excluded.macs,
-                    name        = excluded.name,
-                    vendor      = excluded.vendor,
-                    dev_type    = excluded.dev_type,
-                    rssi_last   = excluded.rssi_last,
-                    rssi_max    = MAX(rssi_max, excluded.rssi_last),
-                    last_seen   = excluded.last_seen,
-                    hits        = hits + 1
-                """,
-                (
-                    ble_key, dev.get("fingerprint"), dev["mac"],
-                    json.dumps(dev.get("macs", [dev["mac"]])),
-                    dev.get("name"), dev.get("vendor"), dev.get("type"),
-                    dev["rssi"], dev["rssi"], now, dev["last_seen"],
-                ),
-            )
-            if sweep_id is not None:
-                # Re-use the same key for sweep observations so a rotating
-                # AirPods only takes one row per sweep.
-                self._record_observation(
-                    cur, sweep_id, "ble", ble_key,
-                    label=dev.get("name"), os_=None,
-                    dev_type=dev.get("type"),
-                    is_phone=False, is_watch=False,
-                    rssi=dev["rssi"], last_seen=dev["last_seen"],
+            try:
+                ble_key   = _ble_storage_key(dev.get("fingerprint"), dev["mac"])
+                is_phone  = self._ble_is_phone(dev)
+                cur.execute(
+                    """
+                    INSERT INTO ble_devices (key, fingerprint, mac_last, macs, name,
+                                             vendor, dev_type, rssi_last, rssi_max,
+                                             first_seen, last_seen, hits)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+                    ON CONFLICT(key) DO UPDATE SET
+                        fingerprint = excluded.fingerprint,
+                        mac_last    = excluded.mac_last,
+                        macs        = excluded.macs,
+                        name        = excluded.name,
+                        vendor      = excluded.vendor,
+                        dev_type    = excluded.dev_type,
+                        rssi_last   = excluded.rssi_last,
+                        rssi_max    = MAX(rssi_max, excluded.rssi_last),
+                        last_seen   = excluded.last_seen,
+                        hits        = hits + 1
+                    """,
+                    (
+                        ble_key, dev.get("fingerprint"), dev["mac"],
+                        json.dumps(dev.get("macs", [dev["mac"]])),
+                        dev.get("name"), dev.get("vendor"), dev.get("type"),
+                        dev["rssi"], dev["rssi"], now, dev["last_seen"],
+                    ),
                 )
+                # BLE alert path: phone-class types (iPhone, AirPods, Apple
+                # Watch, etc.) fire the same red banner the Wi-Fi side
+                # does, deduped per BLE storage key. Without this, BLE
+                # sees the device but never escalates it as a phone.
+                if is_phone:
+                    self._maybe_alert(conn, "ble", ble_key, dev["mac"],
+                                      dev.get("name"), None, dev.get("type"),
+                                      dev["rssi"], dev,
+                                      seen_set=self._seen_phone_fps)
+                if sweep_id is not None:
+                    # Re-use the same key for sweep observations so a rotating
+                    # AirPods only takes one row per sweep.
+                    self._record_observation(
+                        cur, sweep_id, "ble", ble_key,
+                        label=dev.get("name"), os_=None,
+                        dev_type=dev.get("type"),
+                        is_phone=is_phone, is_watch=False,
+                        rssi=dev["rssi"], last_seen=dev["last_seen"],
+                    )
+            except Exception as e:
+                skipped += 1
+                print(f"[persistence] skipping ble row ({dev.get('mac')}): {e}")
 
         conn.commit()
+        if skipped:
+            print(f"[persistence] snapshot kept partial result, skipped {skipped} bad rows")
 
     def _record_observation(self, cur, sweep_id, kind, key, label, os_,
                             dev_type, is_phone, is_watch, rssi, last_seen):

@@ -20,6 +20,20 @@ def _load_ssid_watchlist(path):
                 out.add(line.lower())
     return out
 
+
+def _resolve_watchlist_path():
+    """Prefer the private user-level watchlist at ~/.doperscope/, fall back
+    to the in-repo ssid_watchlist.txt for first-run convenience. The repo
+    copy is intended as a template; production deployments should drop
+    site-specific entries in the user-level file (private perms)."""
+    override = os.environ.get("DOPESCOPE_WATCHLIST_PATH")
+    if override:
+        return override
+    user_path = os.path.expanduser("~/.doperscope/ssid_watchlist.txt")
+    if os.path.isfile(user_path):
+        return user_path
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "ssid_watchlist.txt")
+
 OUI_TABLE = {
     "00:50:f2": "Microsoft",
     "00:0c:e7": "Apple",
@@ -314,8 +328,14 @@ def fingerprint_device(elt_layer):
     vendor_ouis = []
     ie_order = []
 
+    # Cap the IE walk so a crafted frame with a self-referential or
+    # absurdly long IE chain can't pin a CPU or build a multi-MB
+    # fingerprint string. Real frames have well under 50 elements.
+    MAX_IES = 100
     elt = elt_layer
-    while elt and hasattr(elt, "ID"):
+    iters = 0
+    while elt and hasattr(elt, "ID") and iters < MAX_IES:
+        iters += 1
         ie_order.append(elt.ID)
         if elt.ID == 45:
             ht = True
@@ -388,6 +408,10 @@ class WiFiScanner:
         self.interface = interface
         self.devices = {}
         self.clients = {}
+        # Health counters — operators need to see when a scanner has
+        # silently died (UI claims "Scanning…" while no frames arrive).
+        self.error_count    = 0
+        self.last_packet_ts = 0.0
         self._lock = threading.Lock()
         self._running = False
         self._thread = None
@@ -397,8 +421,40 @@ class WiFiScanner:
         self.probes = {}
 
         if watchlist_path is None:
-            watchlist_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ssid_watchlist.txt")
-        self.ssid_watchlist = _load_ssid_watchlist(watchlist_path)
+            watchlist_path = _resolve_watchlist_path()
+        self.ssid_watchlist       = _load_ssid_watchlist(watchlist_path)
+        self.ssid_watchlist_path  = watchlist_path
+        # Track mtime so we can hot-reload when the operator edits the
+        # file mid-sweep without restarting the whole app.
+        try:
+            self._watchlist_mtime = os.path.getmtime(watchlist_path)
+        except OSError:
+            self._watchlist_mtime = 0.0
+        self._watchlist_check_at  = 0.0  # timestamp of last mtime poll
+        self._watchlist_lock      = threading.Lock()
+        if self.ssid_watchlist:
+            print(f"[wifi_scanner] watchlist: {len(self.ssid_watchlist)} entries from {watchlist_path}")
+
+    def _maybe_reload_watchlist(self):
+        """Re-read the watchlist file if its mtime has changed. Polled at
+        most once per second to keep this cheap to call from the parse
+        callback. Safe under self._watchlist_lock so a reload mid-probe
+        doesn't observe a half-mutated set."""
+        now = time.time()
+        if now - self._watchlist_check_at < 1.0:
+            return
+        self._watchlist_check_at = now
+        try:
+            mtime = os.path.getmtime(self.ssid_watchlist_path)
+        except OSError:
+            return
+        if mtime == self._watchlist_mtime:
+            return
+        new_set = _load_ssid_watchlist(self.ssid_watchlist_path)
+        with self._watchlist_lock:
+            self.ssid_watchlist  = new_set
+            self._watchlist_mtime = mtime
+        print(f"[wifi_scanner] watchlist reloaded: {len(new_set)} entries")
 
         self.channels_24 = [1, 6, 11, 2, 7, 3, 8, 4, 9, 5, 10, 13]
         self.channels_5  = [36, 40, 44, 48, 52, 56, 60, 64,
@@ -449,6 +505,7 @@ class WiFiScanner:
                 # so all rotations collapse to a single tracked entry.
                 key = fp["fingerprint"]
                 is_phone = fp["os"] in PHONE_OS_TAGS
+                self._maybe_reload_watchlist()
                 hit_watchlist = bool(ssid) and ssid.lower() in self.ssid_watchlist
                 now = time.time()
 
@@ -485,8 +542,9 @@ class WiFiScanner:
                             "last_seen":       now,
                             "hits":            1,
                         }
+                self.last_packet_ts = now
             except Exception:
-                pass
+                self.error_count += 1
             return
         try:
             bssid = pkt[Dot11].addr3
@@ -499,8 +557,12 @@ class WiFiScanner:
                 if elt.ID == 0:
                     try:
                         ssid = elt.info.decode("utf-8", errors="replace").strip()
-                    except:
-                        ssid = "[decode error]"
+                    except Exception:
+                        # decode("utf-8", errors="replace") doesn't raise on
+                        # bad bytes, so this branch only fires when info isn't
+                        # bytes at all (malformed scapy frame). Treat as hidden
+                        # rather than emitting "[decode error]" as a fake SSID.
+                        ssid = ""
                     break
                 elt = elt.payload.getlayer(Dot11Elt)
 
@@ -541,9 +603,10 @@ class WiFiScanner:
                 if existing:
                     device["rssi"] = int((existing["rssi"] + rssi) / 2)
                 self.devices[bssid] = device
+            self.last_packet_ts = time.time()
 
         except Exception:
-            pass
+            self.error_count += 1
 
     def _parse_client(self, pkt):
         try:
@@ -651,6 +714,16 @@ class WiFiScanner:
             except Exception as e:
                 if self._running:
                     time.sleep(1)  # Brief pause then retry
+            else:
+                # sniff() returned without raising. Normally that only
+                # happens because stop_filter fired and we're shutting
+                # down. But if the interface dies or returns empty
+                # without an exception, this loop would spin tight at
+                # 100% CPU. The defensive sleep is small enough to
+                # disappear during legitimate shutdown but big enough
+                # to keep CPU sane in pathological cases.
+                if self._running:
+                    time.sleep(0.05)
 
     def start(self):
         self._running = True

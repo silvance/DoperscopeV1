@@ -5,9 +5,16 @@ __pycache__/
 .venv/
 venv/
 
+# Local Claude Code MCP server config — may contain API keys for
+# tools like Perplexity/etc that the operator wires up locally.
+.mcp.json
+.mcp.local.json
+
 # Local capture / logs / exports
 doperscope.db
 doperscope.db-journal
+doperscope.db-wal
+doperscope.db-shm
 *.pcap
 *.log
 sweep_*.csv
