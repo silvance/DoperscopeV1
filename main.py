@@ -25,7 +25,7 @@ from input_handler import InputHandler
 from wifi_scanner import WiFiScanner
 from ble_scanner import BLEScanner
 from zigbee_scanner import ZigbeeScanner
-from persistence import Persistence
+from persistence import Persistence, _TRIVIAL_BLE_FP
 
 # ── Colors ───────────────────────────────────────────────
 BG         = (10,  10,  30)
@@ -99,7 +99,15 @@ class Doperscope:
             self.tick_sound = None
         self.last_tick_time = 0
         self.screen = pygame.display.set_mode((640, 480))
-        self.fb     = open("/dev/fb0", "wb")
+        # Framebuffer write target. Missing on dev hosts / CI runners /
+        # any non-Pi machine; degrade to None so the rest of the UI can
+        # still drive scanners + persistence for testing. _render
+        # checks this before writing.
+        try:
+            self.fb = open("/dev/fb0", "wb")
+        except OSError as e:
+            print(f"[doperscope] /dev/fb0 unavailable ({e}); rendering off-screen only")
+            self.fb = None
 
         self.font_title  = pygame.font.SysFont(None, 38)
         self.font_main   = pygame.font.SysFont(None, 30)
@@ -304,8 +312,11 @@ class Doperscope:
             self.scanner.locked_channel = None
 
     def _action_y(self):
-        # Y (shoulder): switch tabs
-        if self.view in ("client_list", "df_mode", "phone_df_mode", "sweep_detail"):
+        # Y (shoulder): switch tabs. Suppressed in every sub-view that
+        # carries unsaved DF / detail state so a fat-finger Y can't
+        # silently drop the operator's lock.
+        if self.view in ("client_list", "df_mode", "ble_df_mode",
+                         "phone_df_mode", "sweep_detail"):
             return
         self.tab      = (self.tab + 1) % len(TABS)
         self.selected = 0
@@ -435,12 +446,15 @@ class Doperscope:
         target_mac = self.ble_df_target["mac"]
         target_fp  = self.ble_df_target.get("fingerprint", "")
         devs = self.ble.get_devices()
-        
+
         # 1. Try to find the target by exact MAC first
         live = next((d for d in devs if d["mac"] == target_mac), None)
 
-        # 2. ANTI-RANDOMIZATION: If MAC is missing, try to find by Fingerprint
-        if not live and target_fp and target_fp != "::":
+        # 2. ANTI-RANDOMIZATION: If MAC is missing, try to find by fingerprint.
+        #    A trivial fingerprint (no mfr / no services) is too weak to use
+        #    as an anti-randomization key, so we skip the fallback for it
+        #    and let the target stay marked missing.
+        if not live and target_fp and target_fp != _TRIVIAL_BLE_FP:
             candidates = [d for d in devs if d.get("fingerprint") == target_fp]
             if candidates:
                 # Grab the most recently seen candidate with this fingerprint
@@ -645,15 +659,14 @@ class Doperscope:
             pygame.draw.rect(self.screen, LOCKED_COL, (0, y, 5, self.ROW_H - 2))
         elif is_selected:
             pygame.draw.rect(self.screen, CYAN, (0, y, 5, self.ROW_H - 2))
-            # TSCM Phone Hunting Logic
+        # Phone hotspots get the same red the phone-row probes use, kept
+        # in sync with the module-level RED so the colour grammar is
+        # consistent across the UI.
         is_phone = dev.get('is_phone', False)
-        RED = (255, 0, 0)
-        
-        # Update ssid_col to show Red for unauthorized phones
         if is_phone:
             ssid_col = RED
         else:
-            ssid_col = LOCKED_COL if is_locked else (WHITE if is_selected else GREY) 
+            ssid_col = LOCKED_COL if is_locked else (WHITE if is_selected else GREY)
         self.screen.blit(
             self.font_main.render(dev.get("ssid", "<Probe>")[:28], True, ssid_col),
             (12, y + 5)
@@ -695,7 +708,7 @@ class Doperscope:
             col    = CYAN if active else GREY
             self.screen.blit(self.font_small.render(f, True, col), (280 + i * 70, 48))
         self.screen.blit(
-            self.font_small.render("X:Sort  Sel:Hidden", True, (60, 60, 80)),
+            self.font_small.render("X:Sort  Sel:Probes", True, (60, 60, 80)),
             (8, 48)
         )
 
@@ -752,7 +765,7 @@ class Doperscope:
                 )
                 draw_signal_bars(self.screen, 580, py + 12, probe["rssi"], height=24)
 
-        self._draw_footer("↕:Scroll  B:DF  A:Clients  X:Sort  TB:BLE  Sel:Probes")
+        self._draw_footer("↕:Scroll  B:DF  A:Clients  X:Sort  Y:Tab  Sel:Probes")
 
     # ── Client list ──────────────────────────────────────
 
@@ -814,7 +827,7 @@ class Doperscope:
                 )
                 draw_signal_bars(self.screen, 580, y + 8, client["rssi"], height=30)
 
-        self._draw_footer("A:Back  ↕:Scroll")
+        self._draw_footer("B/Joy/Start:Back  ↕:Scroll")
 
     # ── DF Mode ──────────────────────────────────────────
 
@@ -909,7 +922,7 @@ class Doperscope:
                 (graph_x + graph_w - 30, gy - 10)
             )
 
-        self._draw_footer("A:Back  B:Reset Peak  Joy:Back")
+        self._draw_footer("B/Joy:Back  Start:Reset Peak")
         self._play_geiger_tick(rssi)
 
     def _draw_ble_df_mode(self):
@@ -1038,7 +1051,7 @@ class Doperscope:
                     (graph_x + graph_w - 30, gy - 10)
                 )
 
-        self._draw_footer("Y:Back  A:Reset Peak  Start:Back")
+        self._draw_footer("B/Joy:Back  Start:Reset Peak")
 
     # ── Phone DF Mode ────────────────────────────────────
 
@@ -1157,7 +1170,7 @@ class Doperscope:
                     (graph_x + graph_w - 30, gy - 10)
                 )
 
-        self._draw_footer("Joy/Start:Back  A:Reset Peak")
+        self._draw_footer("B/Joy:Back  Start:Reset Peak")
         self._play_geiger_tick(rssi)
 
     # ── BLE list ─────────────────────────────────────────
@@ -1225,7 +1238,7 @@ class Doperscope:
                 )
                 draw_signal_bars(self.screen, 580, y + 8, dev["rssi"], height=30)
 
-        self._draw_footer("↕:Scroll  X:Sort  Y:DF Mode  TB:WiFi Tab")
+        self._draw_footer("↕:Scroll  X:Sort  B:DF  Y:Tab  Sel:Freeze")
 
     # ── Phones tab ───────────────────────────────────────
 
@@ -1826,6 +1839,8 @@ class Doperscope:
         # Drawn last so it overlays whatever view is active.
         self._draw_alert_banner()
         pygame.display.flip()
+        if self.fb is None:
+            return
         # tobytes is the modern API; tostring was deprecated in pygame 2.1.3.
         # Fall back to tostring for older pygame on legacy installs.
         try:
@@ -1863,7 +1878,8 @@ class Doperscope:
         except KeyboardInterrupt:
             pass
         finally:
-            self.fb.close()
+            if self.fb is not None:
+                self.fb.close()
             self.scanner.stop()
             self.ble.stop()
             self.zigbee.stop()
