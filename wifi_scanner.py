@@ -521,8 +521,12 @@ class WiFiScanner:
                 if elt.ID == 0:
                     try:
                         ssid = elt.info.decode("utf-8", errors="replace").strip()
-                    except:
-                        ssid = "[decode error]"
+                    except Exception:
+                        # decode("utf-8", errors="replace") doesn't raise on
+                        # bad bytes, so this branch only fires when info isn't
+                        # bytes at all (malformed scapy frame). Treat as hidden
+                        # rather than emitting "[decode error]" as a fake SSID.
+                        ssid = ""
                     break
                 elt = elt.payload.getlayer(Dot11Elt)
 

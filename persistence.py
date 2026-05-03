@@ -33,6 +33,12 @@ DEFAULT_EXPORT_DIR = os.environ.get(
 )
 SNAPSHOT_INTERVAL_S = 5.0
 
+# Drop rows older than this on every startup. 0 disables retention
+# (keep forever — useful for forensic deployments). Default 30 days
+# is plenty for SCIF post-sweep review without growing a 1GB DB on
+# the SD card over a year of operation.
+RETENTION_DAYS = float(os.environ.get("DOPESCOPE_RETENTION_DAYS", "30"))
+
 
 def _ensure_private_dir(path):
     """mkdir -p with mode 0700 — sweep data and watchlists are sensitive."""
@@ -498,6 +504,35 @@ class Persistence:
             conn.execute("DROP TABLE ble_devices")
             conn.commit()
 
+    def _retention_sweep(self, conn):
+        """Drop rows older than RETENTION_DAYS so the SD card doesn't fill
+        over months of operation. Skipped entirely when retention is 0
+        (forensic mode — keep everything)."""
+        if RETENTION_DAYS <= 0:
+            return
+        cutoff = time.time() - RETENTION_DAYS * 86400
+        # Order matters: prune children before parents so the sweeps row
+        # itself can be dropped only after its observations are gone.
+        plans = [
+            ("DELETE FROM phone_alerts        WHERE ts        < ?", "phone_alerts"),
+            ("DELETE FROM wifi_aps            WHERE last_seen < ?", "wifi_aps"),
+            ("DELETE FROM wifi_probes         WHERE last_seen < ?", "wifi_probes"),
+            ("DELETE FROM ble_devices         WHERE last_seen < ?", "ble_devices"),
+            ("DELETE FROM sweep_observations  WHERE last_seen < ?", "sweep_observations"),
+            ("DELETE FROM sweeps              WHERE start_ts  < ?", "sweeps"),
+        ]
+        total = 0
+        for sql, tbl in plans:
+            try:
+                cur = conn.execute(sql, (cutoff,))
+                if cur.rowcount and cur.rowcount > 0:
+                    total += cur.rowcount
+            except Exception as e:
+                print(f"[persistence] retention skip {tbl}: {e}")
+        conn.commit()
+        if total:
+            print(f"[persistence] retention: pruned {total} rows older than {RETENTION_DAYS} days")
+
     def _loop(self):
         # Ensure the data dir exists with private perms BEFORE sqlite3
         # creates the DB file there. Otherwise the DB lands with whatever
@@ -505,10 +540,21 @@ class Persistence:
         _ensure_private_dir(os.path.dirname(os.path.abspath(self._db_path)))
         conn = sqlite3.connect(self._db_path)
         _ensure_private_file(self._db_path)
+        # WAL + synchronous=NORMAL drastically cuts SD-card write
+        # amplification: instead of a full-DB fsync per snapshot we get
+        # one append + a periodic checkpoint. Capture data is recoverable
+        # if power drops mid-write — losing a few seconds of beacons isn't
+        # worth grinding the SD card to dust over a year of operation.
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+        except Exception as e:
+            print(f"[persistence] WAL setup failed (continuing in default mode): {e}")
         try:
             self._migrate(conn)
             conn.executescript(SCHEMA)
             conn.commit()
+            self._retention_sweep(conn)
             print(f"[persistence] db: {self._db_path}")
             while self._running:
                 try:

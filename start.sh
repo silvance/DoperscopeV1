@@ -8,6 +8,26 @@ export DOPESCOPE_WIFI_IFACE="$WIFI_IFACE"
 # 1. Wait for the OS and USB bus to fully settle
 sleep 10
 
+# 1b. Warn (don't block) if NetworkManager is managing the scan
+#     interface. NM aggressively reclaims interfaces it considers its
+#     own, which silently drops them out of monitor mode mid-sweep.
+#     The fix is to mark $WIFI_IFACE unmanaged in NM's config; we
+#     don't apply that automatically since it persists across reboots
+#     and the operator may want to keep their config under their own
+#     control.
+if command -v nmcli >/dev/null 2>&1; then
+    if nmcli -t -f DEVICE,STATE device 2>/dev/null \
+        | grep -E "^${WIFI_IFACE}:(connected|connecting|disconnected)" >/dev/null; then
+        echo "WARNING: NetworkManager is managing $WIFI_IFACE."
+        echo "  It will reclaim the interface mid-scan and drop monitor mode."
+        echo "  To fix permanently, append to /etc/NetworkManager/NetworkManager.conf:"
+        echo "    [keyfile]"
+        echo "    unmanaged-devices=interface-name:$WIFI_IFACE"
+        echo "  Then: sudo systemctl restart NetworkManager"
+        echo "  Continuing — sweeps may be unreliable until that's set."
+    fi
+fi
+
 # 2. Kill any wpa_supplicant that's holding $WIFI_IFACE specifically.
 #    The previous version did `killall wpa_supplicant`, which also
 #    killed the supplicant managing wlan0 (the Pi's onboard Wi-Fi)
