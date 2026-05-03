@@ -48,6 +48,10 @@ class ZigbeeScanner:
         self._thread = None
         self._status_cached = None
         self._status_checked_at = 0.0
+        # Same health surface as WiFiScanner / BLEScanner. Capture is
+        # stubbed so these stay at 0/0.0 until tshark integration lands.
+        self.error_count    = 0
+        self.last_packet_ts = 0.0
 
     def status(self):
         """Return one of:

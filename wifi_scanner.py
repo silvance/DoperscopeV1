@@ -20,6 +20,20 @@ def _load_ssid_watchlist(path):
                 out.add(line.lower())
     return out
 
+
+def _resolve_watchlist_path():
+    """Prefer the private user-level watchlist at ~/.doperscope/, fall back
+    to the in-repo ssid_watchlist.txt for first-run convenience. The repo
+    copy is intended as a template; production deployments should drop
+    site-specific entries in the user-level file (private perms)."""
+    override = os.environ.get("DOPESCOPE_WATCHLIST_PATH")
+    if override:
+        return override
+    user_path = os.path.expanduser("~/.doperscope/ssid_watchlist.txt")
+    if os.path.isfile(user_path):
+        return user_path
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "ssid_watchlist.txt")
+
 OUI_TABLE = {
     "00:50:f2": "Microsoft",
     "00:0c:e7": "Apple",
@@ -388,6 +402,10 @@ class WiFiScanner:
         self.interface = interface
         self.devices = {}
         self.clients = {}
+        # Health counters — operators need to see when a scanner has
+        # silently died (UI claims "Scanning…" while no frames arrive).
+        self.error_count    = 0
+        self.last_packet_ts = 0.0
         self._lock = threading.Lock()
         self._running = False
         self._thread = None
@@ -397,8 +415,11 @@ class WiFiScanner:
         self.probes = {}
 
         if watchlist_path is None:
-            watchlist_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ssid_watchlist.txt")
-        self.ssid_watchlist = _load_ssid_watchlist(watchlist_path)
+            watchlist_path = _resolve_watchlist_path()
+        self.ssid_watchlist      = _load_ssid_watchlist(watchlist_path)
+        self.ssid_watchlist_path = watchlist_path
+        if self.ssid_watchlist:
+            print(f"[wifi_scanner] watchlist: {len(self.ssid_watchlist)} entries from {watchlist_path}")
 
         self.channels_24 = [1, 6, 11, 2, 7, 3, 8, 4, 9, 5, 10, 13]
         self.channels_5  = [36, 40, 44, 48, 52, 56, 60, 64,
@@ -485,8 +506,9 @@ class WiFiScanner:
                             "last_seen":       now,
                             "hits":            1,
                         }
+                self.last_packet_ts = now
             except Exception:
-                pass
+                self.error_count += 1
             return
         try:
             bssid = pkt[Dot11].addr3
@@ -541,9 +563,10 @@ class WiFiScanner:
                 if existing:
                     device["rssi"] = int((existing["rssi"] + rssi) / 2)
                 self.devices[bssid] = device
+            self.last_packet_ts = time.time()
 
         except Exception:
-            pass
+            self.error_count += 1
 
     def _parse_client(self, pkt):
         try:

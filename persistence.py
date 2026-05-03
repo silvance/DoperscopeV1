@@ -16,8 +16,40 @@ import sqlite3
 import threading
 import time
 
-DEFAULT_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "doperscope.db")
+# DB lives in the operator's home directory by default — the previous
+# default put it next to source code, which is a SCIF-hostile place
+# for sensitive sweep data. Override with DOPESCOPE_DB_PATH.
+DEFAULT_DATA_DIR = os.environ.get(
+    "DOPESCOPE_DATA_DIR",
+    os.path.expanduser("~/.doperscope"),
+)
+DEFAULT_DB_PATH = os.environ.get(
+    "DOPESCOPE_DB_PATH",
+    os.path.join(DEFAULT_DATA_DIR, "doperscope.db"),
+)
+DEFAULT_EXPORT_DIR = os.environ.get(
+    "DOPESCOPE_EXPORT_DIR",
+    os.path.join(DEFAULT_DATA_DIR, "exports"),
+)
 SNAPSHOT_INTERVAL_S = 5.0
+
+
+def _ensure_private_dir(path):
+    """mkdir -p with mode 0700 — sweep data and watchlists are sensitive."""
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    try:
+        os.chmod(path, 0o700)
+    except OSError:
+        pass
+
+
+def _ensure_private_file(path):
+    """chmod the file 0600 if it exists. No-op on fresh creates; called
+    after sqlite3.connect so the file definitely exists."""
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
 
 # An in-memory BLE entry with this fingerprint string is "trivial" — no
 # manufacturer data, no services, no usable name. The scanner keeps these
@@ -347,18 +379,18 @@ class Persistence:
         ]
 
     def export_sweep_csv(self, sweep_id, dest_dir=None):
-        """Dump a sweep + every observation to a CSV next to the DB so the
-        operator can pull the SD card and read it without sqlite3 on the
-        receiving box. Returns the absolute path written, or None on
-        failure (missing sweep, IO error)."""
+        """Dump a sweep + every observation to a CSV under ~/.doperscope/exports
+        (or DOPESCOPE_EXPORT_DIR) so the operator can pull the SD card and read
+        it without sqlite3 on the receiving box. Returns the absolute path
+        written, or None on failure (missing sweep, IO error)."""
         sweep = self.get_sweep(sweep_id)
         if not sweep:
             return None
         observations = self.get_sweep_observations(sweep_id, limit=10_000)
         if dest_dir is None:
-            dest_dir = os.path.dirname(os.path.abspath(self._db_path))
+            dest_dir = DEFAULT_EXPORT_DIR
         try:
-            os.makedirs(dest_dir, exist_ok=True)
+            _ensure_private_dir(dest_dir)
         except Exception:
             return None
         # Use the sweep's start time in the filename so multiple exports
@@ -393,6 +425,7 @@ class Persistence:
         except Exception as e:
             print(f"[persistence] export_sweep_csv error: {e}")
             return None
+        _ensure_private_file(path)
         return path
 
     def get_sweep(self, sweep_id):
@@ -466,11 +499,17 @@ class Persistence:
             conn.commit()
 
     def _loop(self):
+        # Ensure the data dir exists with private perms BEFORE sqlite3
+        # creates the DB file there. Otherwise the DB lands with whatever
+        # umask the parent process has.
+        _ensure_private_dir(os.path.dirname(os.path.abspath(self._db_path)))
         conn = sqlite3.connect(self._db_path)
+        _ensure_private_file(self._db_path)
         try:
             self._migrate(conn)
             conn.executescript(SCHEMA)
             conn.commit()
+            print(f"[persistence] db: {self._db_path}")
             while self._running:
                 try:
                     self._snapshot(conn)

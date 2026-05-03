@@ -108,7 +108,9 @@ class Doperscope:
         self.font_huge   = pygame.font.SysFont(None, 96)
         self.font_large  = pygame.font.SysFont(None, 56)
 
-        self.scanner     = WiFiScanner("wlan1")
+        wifi_iface       = os.environ.get("DOPESCOPE_WIFI_IFACE", "wlan1")
+        self.wifi_iface  = wifi_iface
+        self.scanner     = WiFiScanner(wifi_iface)
         self.ble         = BLEScanner()
         self.zigbee      = ZigbeeScanner()
         self.inp         = InputHandler()
@@ -562,22 +564,75 @@ class Doperscope:
             t = self.font_main.render(label, True, WHITE if active else GREY)
             self.screen.blit(t, (x + tab_w // 2 - t.get_width() // 2, 10))
 
+    def _scanner_health_warning(self):
+        """If any scanner has been silent past the threshold or has
+        accumulated parse errors, return a one-line warning string and
+        a colour. Otherwise return (None, None). Capture-stubbed
+        scanners (Zigbee currently) are excluded — they're allowed to
+        be 0/0 without triggering a "silent" alarm."""
+        SILENT_S       = 30.0
+        ERROR_VISIBLE  = 1
+        now = time.time()
+        warnings = []
+        worst_red = False  # any scanner with errors → red, otherwise yellow
+
+        for name, scn, capturing in [
+            ("WiFi", self.scanner, True),
+            ("BLE",  self.ble,     True),
+            # Zigbee not in capture mode yet, so don't alarm on silence.
+        ]:
+            errs = getattr(scn, "error_count", 0)
+            last = getattr(scn, "last_packet_ts", 0.0)
+            silent_for = now - last if last > 0 else None
+            if errs >= ERROR_VISIBLE:
+                warnings.append(f"{name}:{errs}err")
+                worst_red = True
+            elif capturing and (last == 0.0 or silent_for > SILENT_S):
+                if last == 0.0:
+                    warnings.append(f"{name}:no pkt")
+                else:
+                    warnings.append(f"{name}:silent {int(silent_for)}s")
+        if not warnings:
+            return None, None
+        col = RED if worst_red else LOCKED_COL
+        return "⚠ " + "  ".join(warnings), col
+
     def _draw_topbar(self, right_text=""):
         pygame.draw.rect(self.screen, BG_HEADER, (0, 0, 640, 44))
         self._draw_tabs()
-        # Active-sweep prefix in the right_text so the operator can see
-        # it from any tab without leaving their current view.
-        if self.persistence.is_sweep_active():
+        # Compose the right-side status text from up to three pieces:
+        #   1. scanner-health warning (operationally critical — silent
+        #      scanner shouldn't be hidden behind a normal tab status)
+        #   2. active sweep timer
+        #   3. the per-tab right_text the caller passed in
+        # Pulled into one render so they don't fight for screen space.
+        warning, warn_col = self._scanner_health_warning()
+        sweep_active = self.persistence.is_sweep_active()
+        if sweep_active:
             elapsed = int(time.time() - self.persistence.active_sweep_started_at())
             mm, ss  = divmod(max(0, elapsed), 60)
             sweep_str = f"● SWEEP {mm}:{ss:02d}"
+        else:
+            sweep_str = ""
+
+        if warning:
+            # Health warning takes the prime slot. Push other text below.
+            wt = self.font_small.render(warning, True, warn_col)
+            self.screen.blit(wt, (640 - wt.get_width() - 10, 6))
+            tail = "  ".join(s for s in (sweep_str, right_text) if s)
+            if tail:
+                tt = self.font_small.render(tail, True, RED if sweep_active else GREY)
+                self.screen.blit(tt, (640 - tt.get_width() - 10, 24))
+            return
+
+        if sweep_str:
             full = f"{sweep_str}  {right_text}" if right_text else sweep_str
             rt = self.font_small.render(full, True, RED)
-        else:
-            if not right_text:
-                return
+            self.screen.blit(rt, (640 - rt.get_width() - 10, 14))
+            return
+        if right_text:
             rt = self.font_small.render(right_text, True, GREY)
-        self.screen.blit(rt, (640 - rt.get_width() - 10, 14))
+            self.screen.blit(rt, (640 - rt.get_width() - 10, 14))
 
     def _draw_footer(self, text):
         pygame.draw.rect(self.screen, BG_FOOTER, (0, 440, 640, 40))

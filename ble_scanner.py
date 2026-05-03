@@ -85,6 +85,10 @@ class BLEScanner:
         self._running = False
         self._thread  = None
         self._loop    = None
+        # Health counters — same shape as WiFiScanner so the UI can
+        # treat them uniformly.
+        self.error_count    = 0
+        self.last_packet_ts = 0.0
 
     def _get_fingerprint(self, name, mfr_data, services):
         """Creates a unique signature to track devices through MAC rotations."""
@@ -158,8 +162,10 @@ class BLEScanner:
                         "last_seen":   now,
                         "hits":        1,
                     }
+            self.last_packet_ts = now
 
-        except Exception as e:
+        except Exception:
+            self.error_count += 1
             import traceback
             traceback.print_exc()
             
