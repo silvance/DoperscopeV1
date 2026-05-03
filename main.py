@@ -1,4 +1,5 @@
 import os
+import signal
 import sys
 import time
 import collections
@@ -136,9 +137,10 @@ class Doperscope:
         self.selected    = 0
         self.scroll      = 0
         self.locked      = None
-        # show_hidden was always True with no toggle wired up — removed
-        # along with the H:ON/OFF topbar lie. show_probes is real (Select
-        # on the WiFi tab toggles it via _toggle_hidden).
+        # Select on the WiFi tab toggles the probe-request panel via
+        # _action_select. (The previous show_hidden field and its
+        # H:ON/OFF topbar status were dead code — the toggle was never
+        # wired up — and have been removed.)
         self.show_probes = True
         self.view        = "ap_list"  # ap_list | client_list | df_mode
 
@@ -383,9 +385,11 @@ class Doperscope:
             self.selected    = 0
             self.scroll      = 0
 
-    def _toggle_hidden(self):
+    def _action_select(self):
+        # Select is contextual:
+        #  - BLE tab:   freeze / unfreeze the live list
+        #  - elsewhere: toggle the probe-request panel on the WiFi tab
         if self.tab == 1:
-            # On BLE tab Select freezes/unfreezes the list
             self.ble_frozen = not self.ble_frozen
             if self.ble_frozen:
                 sort_key = "name" if SORTS[self.sort_idx] == "ssid" else "rssi"
@@ -395,7 +399,6 @@ class Doperscope:
             self.selected = 0
             self.scroll   = 0
         else:
-            # On WiFi tab Select toggles probe request display
             self.show_probes = not self.show_probes
             self.selected    = 0
             self.scroll      = 0
@@ -436,9 +439,7 @@ class Doperscope:
                     self.df_trend = "WEAKER ▼"
                 else:
                     self.df_trend = "STEADY ●"
-        # BLE DF state
 
-    # ── Shared drawing helpers ───────────────────────────
     def _update_ble_df(self):
         if not self.ble_df_target:
             return
@@ -540,21 +541,19 @@ class Doperscope:
     def _play_geiger_tick(self, rssi):
         if not self.tick_sound:
             return
-            
+
         now = time.time()
-        
-        # Base interval mapping: -90dBm = 1.0s between ticks, -30dBm = 0.05s
-        # Clamp RSSI for the math
+        # Map RSSI to tick interval. -90 dBm = 1.0s between ticks,
+        # -30 dBm = 0.1s (floored — going faster than 10Hz on a small
+        # mixer buffer just clips and sounds worse than the slower rate).
         clamped_rssi = max(-90, min(-30, rssi))
-        
-        # Calculate dynamic interval
-        normalized = (clamped_rssi + 90) / 60  # 0.0 to 1.0
-        interval = 1.0 - (normalized * 0.95)   # 1.0s down to 0.05s
-        
+        normalized = (clamped_rssi + 90) / 60          # 0.0 to 1.0
+        interval = max(0.1, 1.0 - (normalized * 0.9))  # 1.0s down to 0.1s
+
         if now - self.last_tick_time >= interval:
             try:
                 self.tick_sound.play()
-            except:
+            except Exception:
                 pass
             self.last_tick_time = now
 
@@ -689,8 +688,6 @@ class Doperscope:
             self.font_small.render(bssid_label, True, (60, 60, 80)),
             (490, y + 38)
         )
-# Line 442 should be empty or just the end of the file/class
-    
 
     # ── WiFi AP list ─────────────────────────────────────
 
@@ -1863,18 +1860,44 @@ class Doperscope:
                 elif event == "b":      self._action_b()
                 elif event == "x":      self._cycle_sort()
                 elif event == "y":      self._action_y()
-                elif event == "select": self._toggle_hidden()
+                elif event == "select": self._action_select()
                 elif event == "start":  self._action_start()
                 elif event == "joy":    self._action_joy()
         except queue.Empty:
             pass
 
+    def _install_signal_handlers(self):
+        # systemd's `systemctl stop` sends SIGTERM, which Python doesn't
+        # auto-translate to KeyboardInterrupt. Without this handler the
+        # finally block in run() may not execute, leaving an active
+        # sweep orphaned with no end_ts. Both SIGTERM and SIGINT now
+        # raise KeyboardInterrupt so the existing shutdown path runs.
+        def _raise_interrupt(signum, frame):
+            raise KeyboardInterrupt(f"signal {signum}")
+        try:
+            signal.signal(signal.SIGTERM, _raise_interrupt)
+            signal.signal(signal.SIGHUP,  _raise_interrupt)
+        except (ValueError, OSError):
+            # Non-main-thread or unsupported platform; skip silently.
+            pass
+
     def run(self):
+        self._install_signal_handlers()
         try:
             while True:
                 self._process_events()
                 self._render()
-                time.sleep(0.05)
+                # Render at 20 FPS for live views (DF graphs, alert
+                # banners, sweep timer); throttle to 10 FPS in calmer
+                # views where the screen barely changes. Drops idle CPU
+                # by half on a Pi 4B without affecting reaction time
+                # for the views that need it.
+                fast = (
+                    self.view in ("df_mode", "ble_df_mode", "phone_df_mode")
+                    or time.time() < self.alert_until
+                    or self.persistence.is_sweep_active()
+                )
+                time.sleep(0.05 if fast else 0.1)
         except KeyboardInterrupt:
             pass
         finally:

@@ -195,6 +195,47 @@ class PersistenceSweepTests(unittest.TestCase):
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
 
+    def test_csv_export_writes_truncation_warning_when_capped(self):
+        """A sweep with more observations than EXPORT_MAX_ROWS should
+        produce a CSV whose header carries a "# WARNING: truncated"
+        marker so downstream readers don't silently miss the tail."""
+        from persistence import SCHEMA
+        # Cap at 5 so the test stays fast while still exercising the
+        # overflow path.
+        p, tmpdir, db_path = _make_persistence({
+            "DOPESCOPE_RETENTION_DAYS": "0",
+            "DOPESCOPE_EXPORT_MAX_ROWS": "5",
+        })
+        try:
+            os.makedirs(tmpdir, mode=0o700, exist_ok=True)
+            conn = sqlite3.connect(db_path)
+            conn.executescript(SCHEMA)
+            conn.commit()
+            sid = p.start_sweep()
+            now = time.time()
+            cur = conn.cursor()
+            for i in range(20):
+                cur.execute(
+                    "INSERT INTO sweep_observations (sweep_id, kind, key, label, "
+                    "os, dev_type, is_phone, is_watch, rssi_max, rssi_last, "
+                    "first_seen, last_seen, hits) "
+                    "VALUES (?, 'wifi_probe', ?, ?, '', '', 0, 0, -60, -60, ?, ?, 1)",
+                    (sid, f"fp{i}", f"label{i}", now, now),
+                )
+            conn.commit()
+            p.end_sweep()
+            csv_path = p.export_sweep_csv(sid)
+            self.assertIsNotNone(csv_path)
+            with open(csv_path) as f:
+                text = f.read()
+            self.assertIn("# WARNING: truncated", text)
+            data_rows = [l for l in text.splitlines() if l.startswith("wifi_probe,")]
+            self.assertEqual(len(data_rows), 5,
+                f"expected exactly 5 data rows, got {len(data_rows)}")
+            conn.close()
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
 
 class PersistenceBLEAlertTests(unittest.TestCase):
     """The MEDIUM-batch added a BLE alert path so phone-class BLE devices
