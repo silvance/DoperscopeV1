@@ -39,6 +39,12 @@ SNAPSHOT_INTERVAL_S = 5.0
 # the SD card over a year of operation.
 RETENTION_DAYS = float(os.environ.get("DOPESCOPE_RETENTION_DAYS", "30"))
 
+# Maximum observations a CSV export will write per sweep. Sweeps with
+# more rows than this get truncated and a "# WARNING: truncated to N
+# rows" header written into the output. Override for forensic exports
+# that need every row.
+EXPORT_MAX_ROWS = int(os.environ.get("DOPESCOPE_EXPORT_MAX_ROWS", "10000"))
+
 # Default busy timeout for every sqlite3 connection in this module.
 # Without this, two concurrent writers (snapshot thread + UI thread
 # calling start_sweep / end_sweep / export) can race and the loser
@@ -375,7 +381,13 @@ class Persistence:
     def get_sweep_observations(self, sweep_id, limit=500):
         """Return every distinct device captured during a sweep, sorted
         watchlist-first, then phones, then by max RSSI seen during the
-        capture window."""
+        capture window. TTL-cached so the sweep_detail view (which
+        renders at 20fps) doesn't open a fresh sqlite connection per
+        frame."""
+        cache_key = ("get_sweep_observations", sweep_id, limit)
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return cached
         try:
             conn = _connect(self._db_path)
             try:
@@ -392,7 +404,7 @@ class Persistence:
                 conn.close()
         except Exception:
             return []
-        return [
+        result = [
             {
                 "kind": r[0], "key": r[1], "label": r[2],
                 "os": r[3], "dev_type": r[4],
@@ -403,16 +415,25 @@ class Persistence:
             }
             for r in rows
         ]
+        self._cache_put(cache_key, result)
+        return result
 
     def export_sweep_csv(self, sweep_id, dest_dir=None):
         """Dump a sweep + every observation to a CSV under ~/.doperscope/exports
         (or DOPESCOPE_EXPORT_DIR) so the operator can pull the SD card and read
         it without sqlite3 on the receiving box. Returns the absolute path
-        written, or None on failure (missing sweep, IO error)."""
+        written, or None on failure (missing sweep, IO error). Truncation
+        past EXPORT_MAX_ROWS is recorded as a "# WARNING" header so
+        downstream readers don't silently miss the tail of a long sweep."""
         sweep = self.get_sweep(sweep_id)
         if not sweep:
             return None
-        observations = self.get_sweep_observations(sweep_id, limit=10_000)
+        # Pull one extra to detect overflow; we only emit up to
+        # EXPORT_MAX_ROWS but want to know if more existed.
+        observations = self.get_sweep_observations(sweep_id, limit=EXPORT_MAX_ROWS + 1)
+        truncated = len(observations) > EXPORT_MAX_ROWS
+        if truncated:
+            observations = observations[:EXPORT_MAX_ROWS]
         if dest_dir is None:
             dest_dir = DEFAULT_EXPORT_DIR
         try:
@@ -434,6 +455,14 @@ class Persistence:
                 w.writerow(["# devices_seen", sweep["devices_seen"]])
                 w.writerow(["# phones_seen", sweep["phones_seen"]])
                 w.writerow(["# watch_hits", sweep["watch_hits"]])
+                if truncated:
+                    w.writerow([
+                        "# WARNING: truncated",
+                        f"only first {EXPORT_MAX_ROWS} of more rows; "
+                        f"raise DOPESCOPE_EXPORT_MAX_ROWS to capture all",
+                    ])
+                    print(f"[persistence] sweep #{sweep_id} CSV truncated to "
+                          f"{EXPORT_MAX_ROWS} rows")
                 w.writerow([])
                 w.writerow([
                     "kind", "key", "label", "os", "dev_type",

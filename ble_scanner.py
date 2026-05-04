@@ -169,9 +169,11 @@ class BLEScanner:
             self.last_packet_ts = now
 
         except Exception:
+            # error_count is the actionable signal — the topbar warning
+            # surfaces it. A traceback per malformed advert would spam
+            # stderr without telling the operator anything they didn't
+            # already know from the count climbing.
             self.error_count += 1
-            import traceback
-            traceback.print_exc()
             
     async def _scan(self):
         # The `async with` block tears the BleakScanner down cleanly when
