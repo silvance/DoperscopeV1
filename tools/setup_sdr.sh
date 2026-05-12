@@ -58,9 +58,12 @@ blacklist rtl2830
 EOF
 
 echo "==> 3/4: srsRAN_4G from source"
-# Skip if it's already installed.
-if command -v srsue >/dev/null 2>&1; then
-    echo "    srsue already on PATH, skipping build"
+# Skip only if BOTH srsue AND cell_search are already on PATH.
+# Doperscope's SDR scanner shells out to cell_search — an example binary
+# that srsRAN_4G's `make install` does not put on PATH by default — so
+# we need both present to consider this step complete.
+if command -v srsue >/dev/null 2>&1 && command -v cell_search >/dev/null 2>&1; then
+    echo "    srsue + cell_search already on PATH, skipping build"
 else
     cd /tmp
     rm -rf srsRAN_4G
@@ -71,6 +74,14 @@ else
     # Pi 4B has 4 cores; -j4 keeps the build under an hour without OOM.
     make -j4
     make install
+    # srsRAN_4G doesn't install the example binaries by default. Copy
+    # cell_search onto PATH so sdr_scanner.py can invoke it directly.
+    if [ -x lib/examples/cell_search ]; then
+        install -m 0755 lib/examples/cell_search /usr/local/bin/cell_search
+    else
+        echo "    WARN: cell_search example binary not found in build tree."
+        echo "          LTE cell discovery will be disabled until you install it manually."
+    fi
     ldconfig
     cd /
     rm -rf /tmp/srsRAN_4G
@@ -96,12 +107,14 @@ SDR setup complete. REBOOT now so:
 After reboot, smoke-test:
   lsusb | grep -i realtek        # should show 0bda:2838 (or :2832)
   rtl_test -t                    # should report 'Found 1 device(s)'
-  srsue --help                   # should print srsue's CLI
+  grgsm_scanner --help           # 2G enumeration binary
+  cell_search -h                 # LTE cell-search example binary
 
-Then drop an OpenCellID US snapshot at:
+Then drop an OpenCellID US snapshot at (used by stage 3):
   $DATA_DIR/opencellid/ocid_us.csv
 
-Doperscope's Cell tab should switch from NO SDR to FW OK / NO CAPTURE
-after reboot. Stage 2 will start populating the live cell list.
+Doperscope's Cell tab should switch from NO SDR to SCANNING within the
+first ~30s after launch and start populating the live cell list as it
+cycles US bands.
 ==================================================================
 EOF

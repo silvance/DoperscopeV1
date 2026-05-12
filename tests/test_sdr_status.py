@@ -54,6 +54,31 @@ class SDRStatusTests(unittest.TestCase):
         s = self.SDRScanner()
         self.assertEqual(s.status(), "present")
 
+    def test_scanning_when_capture_active(self):
+        # Once the capture loop has parsed at least one cell, _capturing
+        # is True and status() should flip from "present" to "scanning".
+        subprocess.run = _patch_lsusb(
+            "Bus 001 Device 006: ID 0bda:2838 Realtek RTL2832U\n"
+        )
+        s = self.SDRScanner()
+        s._capturing = True
+        self.assertEqual(s.status(), "scanning")
+
+    def test_scanning_drops_to_absent_when_dongle_yanked(self):
+        # If the operator yanks the RTL-SDR mid-scan, status must NOT
+        # keep reporting "scanning" off the cached _capturing flag —
+        # the lsusb check is the source of truth for hardware presence.
+        subprocess.run = _patch_lsusb(
+            "Bus 001 Device 006: ID 0bda:2838 Realtek RTL2832U\n"
+        )
+        s = self.SDRScanner()
+        s._capturing = True
+        self.assertEqual(s.status(), "scanning")
+        # Bust the 5s status cache and report no dongle.
+        s._status_cached = None
+        subprocess.run = _patch_lsusb("")
+        self.assertEqual(s.status(), "absent")
+
     def test_absent_when_only_unrelated_devices(self):
         # Random Realtek Ethernet, Bluetooth hub, etc. — should not trip
         # on Realtek VID alone.

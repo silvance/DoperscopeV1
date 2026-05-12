@@ -243,9 +243,13 @@ CREATE INDEX IF NOT EXISTS ix_cell_alerts_ts ON cell_alerts(ts);
 
 
 class Persistence:
-    def __init__(self, wifi_scanner, ble_scanner, db_path=DEFAULT_DB_PATH):
+    def __init__(self, wifi_scanner, ble_scanner, sdr_scanner=None, db_path=DEFAULT_DB_PATH):
         self._wifi = wifi_scanner
         self._ble  = ble_scanner
+        # SDR is optional so the persistence test suite can construct a
+        # Persistence with just the two original scanners. main.py passes
+        # the real SDRScanner so cell_observations land on disk.
+        self._sdr  = sdr_scanner
         self._db_path = db_path
         self._running = False
         self._thread  = None
@@ -829,6 +833,50 @@ class Persistence:
             except Exception as e:
                 skipped += 1
                 print(f"[persistence] skipping ble row ({dev.get('mac')}): {e}")
+
+        # Cell observations from the SDR scanner — stage 2 of the rogue
+        # base station pipeline. Stage 3 (heuristics + cell_alerts) reads
+        # this same upsert path and produces risk + reasons columns.
+        if self._sdr is not None:
+            for cell in self._sdr.get_cells():
+                try:
+                    cur.execute(
+                        """
+                        INSERT INTO cell_observations
+                            (mcc, mnc, cell_id, tech, earfcn, arfcn, tac, lac, pci,
+                             rssi_last, rssi_max, risk, reasons,
+                             first_seen, last_seen, hits)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+                        ON CONFLICT(mcc, mnc, cell_id, tech) DO UPDATE SET
+                            earfcn    = COALESCE(excluded.earfcn,    earfcn),
+                            arfcn     = COALESCE(excluded.arfcn,     arfcn),
+                            tac       = COALESCE(excluded.tac,       tac),
+                            lac       = COALESCE(excluded.lac,       lac),
+                            pci       = COALESCE(excluded.pci,       pci),
+                            rssi_last = excluded.rssi_last,
+                            rssi_max  = MAX(rssi_max, excluded.rssi_last),
+                            risk      = MAX(risk, excluded.risk),
+                            reasons   = COALESCE(excluded.reasons, reasons),
+                            last_seen = excluded.last_seen,
+                            hits      = hits + 1
+                        """,
+                        (
+                            cell.get("mcc"), cell.get("mnc"),
+                            cell.get("cell_id"), cell.get("tech"),
+                            cell.get("earfcn"), cell.get("arfcn"),
+                            cell.get("tac"),    cell.get("lac"),
+                            cell.get("pci"),
+                            cell.get("rssi"),   cell.get("rssi"),
+                            cell.get("risk", 0),
+                            json.dumps(cell.get("reasons")) if cell.get("reasons") else None,
+                            cell.get("first_seen", now), cell.get("last_seen", now),
+                        ),
+                    )
+                except Exception as e:
+                    skipped += 1
+                    print(f"[persistence] skipping cell row "
+                          f"({cell.get('tech')} {cell.get('mcc')}-{cell.get('mnc')}-"
+                          f"{cell.get('cell_id')}): {e}")
 
         conn.commit()
         if skipped:
