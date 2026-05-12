@@ -33,6 +33,8 @@ import subprocess
 import threading
 import time
 
+from cell_analyzer import score_cell
+
 # All RTL2832U-based dongles enumerate with Realtek VID 0bda. The v4
 # variant uses the same VID:PIDs as earlier generations (it's
 # distinguished only by tuner chip); for the "is a usable SDR plugged in"
@@ -165,6 +167,11 @@ class SDRScanner:
         # don't shell out shutil.which() on every band cycle.
         self._has_grgsm = False
         self._has_lte   = False
+        # OpenCellID baseline for rogue-cell scoring. None means no
+        # baseline available; score_cell() handles that gracefully by
+        # skipping the baseline-dependent heuristics. main.py loads
+        # this at startup and hands it to us via set_baseline().
+        self._baseline = None
         # Same health surface as WiFiScanner / BLEScanner / ZigbeeScanner
         # so the topbar warning logic treats them uniformly.
         self.error_count    = 0
@@ -206,6 +213,20 @@ class SDRScanner:
         """True if an RTL-SDR is plugged in. The Cell tab uses this to
         decide whether to render NO SDR vs. live capture state."""
         return self.status() != "absent"
+
+    def set_baseline(self, baseline):
+        """Install an OpenCellID baseline (set of (mcc, mnc, cell_id, tech)
+        tuples) for the heuristic scorer. Pass None to disable
+        baseline-aware scoring. Re-scores any cells already observed
+        so the UI doesn't have to wait for the next capture cycle to
+        reflect the new baseline."""
+        self._baseline = baseline
+        with self._lock:
+            all_cells = list(self.cells.values())
+            for cell in all_cells:
+                risk, reasons = score_cell(cell, baseline, all_cells)
+                cell["risk"]    = risk
+                cell["reasons"] = reasons
 
     def start(self):
         if self._running:
@@ -358,8 +379,8 @@ class SDRScanner:
                 cell["last_seen"]  = now
                 cell["hits"]       = 1
                 cell["rssi_max"]   = rssi
-                cell["risk"]       = 0  # populated by stage-3 heuristics
                 self.cells[key] = cell
+                target = cell
             else:
                 existing["last_seen"] = now
                 existing["hits"]      = existing.get("hits", 0) + 1
@@ -370,6 +391,15 @@ class SDRScanner:
                 for f in ("earfcn", "arfcn", "tac", "lac", "pci"):
                     if f in cell and cell[f] is not None:
                         existing[f] = cell[f]
+                target = existing
+            # Score the cell every time we touch it. The heuristics
+            # depend on hits + rssi_max + the live set of co-observed
+            # cells, so a re-observation can move risk up or down.
+            risk, reasons = score_cell(
+                target, self._baseline, self.cells.values()
+            )
+            target["risk"]    = risk
+            target["reasons"] = reasons
 
     def get_cells(self, sort_by="rssi"):
         with self._lock:

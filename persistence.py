@@ -45,6 +45,12 @@ RETENTION_DAYS = float(os.environ.get("DOPESCOPE_RETENTION_DAYS", "30"))
 # that need every row.
 EXPORT_MAX_ROWS = int(os.environ.get("DOPESCOPE_EXPORT_MAX_ROWS", "10000"))
 
+# Risk score above which a cell observation fires a cell_alert. Default
+# 70 catches the textbook stingray combinations (not-in-baseline +
+# strong-brief, or non-US-MCC alone) without false-firing on legitimate
+# MVNO cells absent from the OCID snapshot.
+CELL_ALERT_RISK = int(os.environ.get("DOPESCOPE_CELL_ALERT_RISK", "70"))
+
 # Default busy timeout for every sqlite3 connection in this module.
 # Without this, two concurrent writers (snapshot thread + UI thread
 # calling start_sweep / end_sweep / export) can race and the loser
@@ -255,9 +261,11 @@ class Persistence:
         self._thread  = None
 
         # In-session dedup for alerts. Separate sets so a fingerprint can
-        # alert once as a phone AND once as a watchlist hit.
+        # alert once as a phone AND once as a watchlist hit. Cell alerts
+        # get their own set keyed by (mcc, mnc, cell_id, tech).
         self._seen_phone_fps     = set()
         self._seen_watchlist_fps = set()
+        self._seen_cell_keys     = set()
         self._alert_queue    = queue.Queue()
 
         # Active sweep state. Protected by _sweep_lock so the UI thread
@@ -557,7 +565,10 @@ class Persistence:
     def get_recent_alerts(self, limit=50):
         """Read the most recent alerts from disk for the Log tab. Opens a
         fresh read-only connection so it's safe to call from the UI thread.
-        Result is cached for ~1s to avoid per-frame sqlite churn."""
+        Result is cached for ~1s to avoid per-frame sqlite churn.
+
+        Pulls from both phone_alerts and cell_alerts so the Log tab
+        shows one unified timeline."""
         cache_key = ("get_recent_alerts", limit)
         cached = self._cache_get(cache_key)
         if cached is not None:
@@ -565,9 +576,16 @@ class Persistence:
         try:
             conn = _connect(self._db_path)
             try:
-                rows = conn.execute(
+                phone_rows = conn.execute(
                     """SELECT ts, kind, fingerprint, mac, ssid, os, dev_type, rssi
                        FROM phone_alerts
+                       ORDER BY ts DESC
+                       LIMIT ?""",
+                    (limit,),
+                ).fetchall()
+                cell_rows = conn.execute(
+                    """SELECT ts, mcc, mnc, cell_id, tech, risk, reasons, rssi
+                       FROM cell_alerts
                        ORDER BY ts DESC
                        LIMIT ?""",
                     (limit,),
@@ -581,8 +599,30 @@ class Persistence:
                 "ts": r[0], "kind": r[1], "fingerprint": r[2], "mac": r[3],
                 "ssid": r[4], "os": r[5], "dev_type": r[6], "rssi": r[7],
             }
-            for r in rows
+            for r in phone_rows
         ]
+        for r in cell_rows:
+            ts, mcc, mnc, cid, tech, risk, reasons_json, rssi = r
+            # Render reasons as a human-readable comma list in the ssid
+            # column so the Log tab — which already prints alert.ssid —
+            # surfaces the heuristic trigger without UI changes.
+            try:
+                reasons = ",".join(json.loads(reasons_json)) if reasons_json else ""
+            except Exception:
+                reasons = ""
+            result.append({
+                "ts": ts, "kind": "cell",
+                "fingerprint": f"cell:{tech}-{mcc}-{mnc}-{cid}",
+                "mac": None,
+                "ssid": reasons,
+                "os": None,
+                "dev_type": f"Cell:{tech} risk:{risk}",
+                "rssi": rssi,
+            })
+        # Sort the merged list by ts desc, cap to limit so the Log tab
+        # gets a unified view regardless of which alert kind dominates.
+        result.sort(key=lambda a: a["ts"], reverse=True)
+        result = result[:limit]
         self._cache_put(cache_key, result)
         return result
 
@@ -834,12 +874,19 @@ class Persistence:
                 skipped += 1
                 print(f"[persistence] skipping ble row ({dev.get('mac')}): {e}")
 
-        # Cell observations from the SDR scanner — stage 2 of the rogue
-        # base station pipeline. Stage 3 (heuristics + cell_alerts) reads
-        # this same upsert path and produces risk + reasons columns.
+        # Cell observations from the SDR scanner. Stage 2 wrote the
+        # observations; stage 3 layers the alert side — cells whose
+        # heuristic risk crosses CELL_ALERT_RISK fire a cell_alert
+        # exactly once per (mcc,mnc,cell_id,tech) per session, on the
+        # same _alert_queue as phone alerts so the UI banner picks them
+        # up uniformly.
         if self._sdr is not None:
             for cell in self._sdr.get_cells():
                 try:
+                    reasons_json = (
+                        json.dumps(cell.get("reasons"))
+                        if cell.get("reasons") else None
+                    )
                     cur.execute(
                         """
                         INSERT INTO cell_observations
@@ -868,10 +915,11 @@ class Persistence:
                             cell.get("pci"),
                             cell.get("rssi"),   cell.get("rssi"),
                             cell.get("risk", 0),
-                            json.dumps(cell.get("reasons")) if cell.get("reasons") else None,
+                            reasons_json,
                             cell.get("first_seen", now), cell.get("last_seen", now),
                         ),
                     )
+                    self._maybe_cell_alert(conn, cell, reasons_json)
                 except Exception as e:
                     skipped += 1
                     print(f"[persistence] skipping cell row "
@@ -908,6 +956,47 @@ class Persistence:
                 int(bool(is_phone)), int(bool(is_watch)),
                 rssi, rssi, last_seen, last_seen,
             ),
+        )
+
+    def _maybe_cell_alert(self, conn, cell, reasons_json):
+        """Fire a cell_alert exactly once per (mcc,mnc,cell_id,tech) per
+        session when the heuristic risk crosses CELL_ALERT_RISK. Writes
+        cell_alerts on the same connection as the snapshot upserts (so
+        we don't fight ourselves for the SQLite write lock) and pushes
+        onto the same alert queue as phone alerts (so the red banner +
+        Log tab pipeline carries them uniformly)."""
+        risk = cell.get("risk", 0)
+        if risk < CELL_ALERT_RISK:
+            return
+        key = (cell.get("mcc"), cell.get("mnc"),
+               cell.get("cell_id"), cell.get("tech"))
+        if None in key or key in self._seen_cell_keys:
+            return
+        self._seen_cell_keys.add(key)
+        reasons = cell.get("reasons") or []
+        alert = {
+            "ts": time.time(),
+            "kind": "cell",
+            # fingerprint shape: "cell:GSM-310-260-1234" — stable string
+            # so the UI banner can include it without re-stringifying.
+            "fingerprint": f"cell:{key[3]}-{key[0]}-{key[1]}-{key[2]}",
+            "mac": None,
+            "ssid": ",".join(reasons),
+            "os": None,
+            "dev_type": f"Cell:{key[3]}",
+            "rssi": cell.get("rssi"),
+            "risk": risk,
+        }
+        self._alert_queue.put(alert)
+        safe = {k: (sorted(v) if isinstance(v, set) else v)
+                for k, v in cell.items()}
+        conn.execute(
+            """INSERT INTO cell_alerts (ts, mcc, mnc, cell_id, tech,
+                                        risk, reasons, rssi, detail)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (alert["ts"], key[0], key[1], key[2], key[3],
+             risk, reasons_json, cell.get("rssi"),
+             json.dumps(safe, default=str)),
         )
 
     def _maybe_alert(self, conn, kind, fp, mac, ssid, os_, dev_type, rssi, raw, seen_set):
