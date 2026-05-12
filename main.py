@@ -26,6 +26,7 @@ from input_handler import InputHandler
 from wifi_scanner import WiFiScanner
 from ble_scanner import BLEScanner
 from zigbee_scanner import ZigbeeScanner
+from sdr_scanner import SDRScanner
 from persistence import Persistence, _TRIVIAL_BLE_FP
 
 # ── Colors ───────────────────────────────────────────────
@@ -47,7 +48,10 @@ LOCKED_COL = (255, 200,   0)
 
 WIFI_FILTERS = ["ALL", "2.4G", "5G"]
 SORTS        = ["rssi", "ssid", "channel"]
-TABS         = ["WiFi", "BLE", "Phones", "Zigbee", "Log"]
+TABS         = ["WiFi", "BLE", "Phones", "Cell", "Zigbee", "Log"]
+# Tab-index constants. Use these everywhere instead of literal ints so
+# inserting / reordering tabs only touches the TABS list above.
+TAB_WIFI, TAB_BLE, TAB_PHONES, TAB_CELL, TAB_ZIGBEE, TAB_LOG = range(len(TABS))
 
 # DF mode history length
 DF_HISTORY = 60
@@ -122,6 +126,7 @@ class Doperscope:
         self.scanner     = WiFiScanner(wifi_iface)
         self.ble         = BLEScanner()
         self.zigbee      = ZigbeeScanner()
+        self.sdr         = SDRScanner()
         self.inp         = InputHandler()
         self.persistence = Persistence(self.scanner, self.ble)
 
@@ -188,6 +193,7 @@ class Doperscope:
         self.scanner.start()
         self.ble.start()
         self.zigbee.start()
+        self.sdr.start()
         self.persistence.start()
 
     # ── Button bindings ──────────────────────────────────
@@ -225,13 +231,15 @@ class Doperscope:
             items = self.persistence.get_sweep_observations(self.sweep_detail_id)
         elif self.view == "client_list":
             items = self.scanner.get_clients(self.locked["bssid"])
-        elif self.tab == 1:
+        elif self.tab == TAB_BLE:
             items = self.ble.get_devices()
-        elif self.tab == 2:
+        elif self.tab == TAB_PHONES:
             items = self.scanner.get_probes(phones_only=True)
-        elif self.tab == 3:
+        elif self.tab == TAB_CELL:
+            items = self.sdr.get_cells()
+        elif self.tab == TAB_ZIGBEE:
             items = self.zigbee.get_devices()
-        elif self.tab == 4:
+        elif self.tab == TAB_LOG:
             if self.log_view == "sweeps":
                 items = self.persistence.list_sweeps()
             else:
@@ -244,7 +252,7 @@ class Doperscope:
 
     def _action_a(self):
         # A: enter client view from AP list
-        if self.tab == 0 and self.view == "ap_list":
+        if self.tab == TAB_WIFI and self.view == "ap_list":
             devs = self._get_wifi_devices()
             if devs and 0 <= self.selected < len(devs):
                 self.locked   = devs[self.selected]
@@ -252,7 +260,7 @@ class Doperscope:
                 self.view     = "client_list"
                 self.selected = 0
                 self.scroll   = 0
-        elif self.tab == 4 and self.view == "ap_list" and self.log_view == "sweeps":
+        elif self.tab == TAB_LOG and self.view == "ap_list" and self.log_view == "sweeps":
             # A on a sweep row drills into the captured observations.
             sweeps = self.persistence.list_sweeps()
             if sweeps and 0 <= self.selected < len(sweeps):
@@ -262,7 +270,7 @@ class Doperscope:
                 self.scroll          = 0
 
     def _action_b(self):
-        if self.view == "ap_list" and self.tab == 0:
+        if self.view == "ap_list" and self.tab == TAB_WIFI:
             # WiFi DF mode
             devs = self._get_wifi_devices()
             if devs and 0 <= self.selected < len(devs):
@@ -273,7 +281,7 @@ class Doperscope:
                 self.df_avg     = -100
                 self.df_last    = -100
                 self.df_trend   = "STEADY"
-        elif self.view == "ap_list" and self.tab == 1:
+        elif self.view == "ap_list" and self.tab == TAB_BLE:
             # BLE DF mode
             devs = self.ble.get_devices()
             if devs and 0 <= self.selected < len(devs):
@@ -285,14 +293,14 @@ class Doperscope:
                 self.ble_df_last    = -100
                 self.ble_df_trend   = "STEADY"
                 self.ble_df_missing = False
-        elif self.view == "ap_list" and self.tab == 4:
+        elif self.view == "ap_list" and self.tab == TAB_LOG:
             # Log tab — B toggles the active sweep.
             if self.persistence.is_sweep_active():
                 self.persistence.end_sweep()
             else:
                 self.persistence.start_sweep()
             return
-        elif self.view == "ap_list" and self.tab == 2:
+        elif self.view == "ap_list" and self.tab == TAB_PHONES:
             # Phone DF mode — fingerprint-locked.
             probes = self.scanner.get_probes(phones_only=True)
             if probes and 0 <= self.selected < len(probes):
@@ -372,7 +380,7 @@ class Doperscope:
             else:
                 self.alert_text = "EXPORT FAILED"
             return
-        if self.tab == 4:
+        if self.tab == TAB_LOG:
             self.log_view = "alerts" if self.log_view == "sweeps" else "sweeps"
             self.selected = 0
             self.scroll   = 0
@@ -380,7 +388,7 @@ class Doperscope:
         self.sort_idx = (self.sort_idx + 1) % len(SORTS)
 
     def _cycle_wifi_filter(self):
-        if self.tab == 0 and self.view == "ap_list":
+        if self.tab == TAB_WIFI and self.view == "ap_list":
             self.wifi_filter = (self.wifi_filter + 1) % len(WIFI_FILTERS)
             self.selected    = 0
             self.scroll      = 0
@@ -389,7 +397,7 @@ class Doperscope:
         # Select is contextual:
         #  - BLE tab:   freeze / unfreeze the live list
         #  - elsewhere: toggle the probe-request panel on the WiFi tab
-        if self.tab == 1:
+        if self.tab == TAB_BLE:
             self.ble_frozen = not self.ble_frozen
             if self.ble_frozen:
                 sort_key = "name" if SORTS[self.sort_idx] == "ssid" else "rssi"
@@ -559,9 +567,12 @@ class Doperscope:
 
     def _draw_tabs(self):
         # Auto-shrink tab width as tabs are added so right_text in the
-        # topbar still has room.
+        # topbar still has room. 6 tabs at 60px is the practical floor
+        # before the labels themselves start clipping.
         n     = len(TABS)
-        if n >= 5:
+        if n >= 6:
+            tab_w = 60
+        elif n >= 5:
             tab_w = 72
         elif n >= 4:
             tab_w = 90
@@ -1325,6 +1336,110 @@ class Doperscope:
 
         self._draw_footer("up/dn:Scroll  B:DF  Y:Tab  Edit ssid_watchlist.txt to tune")
 
+    # ── Cell tab ─────────────────────────────────────────
+
+    def _draw_cell_list(self):
+        sstatus = self.sdr.status()
+        cells   = self.sdr.get_cells() if sstatus == "present" else []
+
+        if sstatus == "present":
+            label = "FW OK / NO CAPTURE"
+        else:
+            label = "NO SDR"
+        self._draw_topbar(right_text=f"{label}  {len(cells)}c")
+
+        if sstatus == "absent":
+            pygame.draw.rect(self.screen, (40, 8, 8), (0, 44, 640, 22))
+            self.screen.blit(
+                self.font_small.render("RTL-SDR v4 not detected on USB.", True, ORANGE),
+                (8, 48)
+            )
+            lines = [
+                "Plug in the RTL-SDR v4 (Realtek RTL2832U) and re-launch.",
+                "",
+                "Mission: rogue base station detection in non-SCIF spaces",
+                "  - LTE cell discovery via srsRAN cell_search + SIB1 decode",
+                "  - 2G cell enum via grgsm_scanner (catches downgrade attacks)",
+                "  - OpenCellID US snapshot as the legitimacy baseline",
+                "",
+                "Once the dongle is in, run tools/setup_sdr.sh to install",
+                "srsRAN + gr-gsm + RTL-SDR udev rules. Stage 2 wires the",
+                "capture loop; stage 3 layers the rogue-detection heuristics.",
+            ]
+            y = 90
+            for line in lines:
+                self.screen.blit(self.font_small.render(line, True, GREY), (24, y))
+                y += 22
+            self._draw_footer("Y:Tab")
+            return
+
+        # sstatus == "present"
+        pygame.draw.rect(self.screen, (50, 30, 0), (0, 44, 640, 22))
+        self.screen.blit(
+            self.font_small.render(
+                "RTL-SDR detected. Doperscope's cell-decode integration is NOT yet active.",
+                True, LOCKED_COL
+            ),
+            (8, 48)
+        )
+
+        if not cells:
+            self.screen.blit(
+                self.font_main.render("Awaiting first cell observation...", True, GREY),
+                (140, 240)
+            )
+            self.screen.blit(
+                self.font_small.render(
+                    "Stage 2 will wire srsRAN + grgsm_scanner into _run_loop.",
+                    True, (90, 90, 110)
+                ),
+                (90, 274)
+            )
+        else:
+            ROW_H   = 70
+            VISIBLE = 5
+            visible = cells[self.scroll: self.scroll + VISIBLE]
+            for i, cell in enumerate(visible):
+                y      = 68 + i * ROW_H
+                abs_i  = self.scroll + i
+                is_sel = (abs_i == self.selected)
+                risk   = cell.get("risk", 0)
+                # Higher-risk cells get a louder colour grammar — matches
+                # the watchlist/phone pattern from the Wi-Fi side.
+                stripe = RED if risk >= 70 else (LOCKED_COL if risk >= 30 else CYAN)
+                pygame.draw.rect(
+                    self.screen, BG_SEL if is_sel else BG_ROW,
+                    (0, y, 640, ROW_H - 2)
+                )
+                pygame.draw.rect(self.screen, stripe, (0, y, 5, ROW_H - 2))
+                top_col = RED if risk >= 70 else (WHITE if is_sel else GREY)
+                self.screen.blit(
+                    self.font_main.render(
+                        f"{cell.get('tech','?')} {cell.get('mcc','?')}-{cell.get('mnc','?')}  "
+                        f"cell {cell.get('cell_id','?')}",
+                        True, top_col
+                    ),
+                    (12, y + 5)
+                )
+                self.screen.blit(
+                    self.font_small.render(
+                        f"PCI:{cell.get('pci','?')}  EARFCN:{cell.get('earfcn','?')}  "
+                        f"TAC:{cell.get('tac','?')}  risk:{risk}",
+                        True, CYAN
+                    ),
+                    (12, y + 34)
+                )
+                self.screen.blit(
+                    self.font_rssi.render(
+                        f"{cell.get('rssi', -120)}dBm",
+                        True, rssi_color(cell.get("rssi", -120))
+                    ),
+                    (490, y + 5)
+                )
+                draw_signal_bars(self.screen, 580, y + 8, cell.get("rssi", -120), height=30)
+
+        self._draw_footer("Y:Tab")
+
     # ── Zigbee tab ───────────────────────────────────────
 
     def _draw_zigbee_list(self):
@@ -1823,13 +1938,15 @@ class Doperscope:
             self._draw_sweep_detail()
         elif self.view == "client_list" and self.locked:
             self._draw_client_list()
-        elif self.tab == 1:
+        elif self.tab == TAB_BLE:
             self._draw_ble_list()
-        elif self.tab == 2:
+        elif self.tab == TAB_PHONES:
             self._draw_phones_list()
-        elif self.tab == 3:
+        elif self.tab == TAB_CELL:
+            self._draw_cell_list()
+        elif self.tab == TAB_ZIGBEE:
             self._draw_zigbee_list()
-        elif self.tab == 4:
+        elif self.tab == TAB_LOG:
             self._draw_log_list()
         else:
             self._draw_ap_list()
@@ -1906,6 +2023,7 @@ class Doperscope:
             self.scanner.stop()
             self.ble.stop()
             self.zigbee.stop()
+            self.sdr.stop()
             self.persistence.stop()
             self.inp.cleanup()
             pygame.quit()

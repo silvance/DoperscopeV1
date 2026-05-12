@@ -196,6 +196,49 @@ CREATE TABLE IF NOT EXISTS sweep_observations (
     PRIMARY KEY (sweep_id, kind, key)
 );
 CREATE INDEX IF NOT EXISTS ix_sweep_obs_sweep ON sweep_observations(sweep_id);
+
+-- Cell observations from the RTL-SDR scanner. One row per
+-- (mcc, mnc, cell_id, tech) — a cell that re-appears just updates
+-- last_seen + rssi_max. risk is the rogue-base-station heuristic
+-- score 0-100; populated when the heuristics layer ships in stage 3.
+CREATE TABLE IF NOT EXISTS cell_observations (
+    mcc          INTEGER,
+    mnc          INTEGER,
+    cell_id      INTEGER,
+    tech         TEXT,        -- 'LTE' | 'GSM'
+    earfcn       INTEGER,     -- LTE ARFCN; NULL for GSM
+    arfcn        INTEGER,     -- GSM ARFCN; NULL for LTE
+    tac          INTEGER,     -- LTE TAC
+    lac          INTEGER,     -- GSM LAC
+    pci          INTEGER,     -- LTE physical cell ID
+    rssi_last    INTEGER,
+    rssi_max     INTEGER,
+    risk         INTEGER,
+    reasons      TEXT,        -- JSON list of heuristic-trigger strings
+    first_seen   REAL,
+    last_seen    REAL,
+    hits         INTEGER DEFAULT 1,
+    PRIMARY KEY (mcc, mnc, cell_id, tech)
+);
+CREATE INDEX IF NOT EXISTS ix_cells_last_seen ON cell_observations(last_seen);
+CREATE INDEX IF NOT EXISTS ix_cells_risk      ON cell_observations(risk);
+
+-- One row each time a cell with risk >= alert threshold appears for
+-- the first time in a session. Parallel structure to phone_alerts so
+-- the Log tab and existing alert UI can carry both kinds.
+CREATE TABLE IF NOT EXISTS cell_alerts (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts           REAL NOT NULL,
+    mcc          INTEGER,
+    mnc          INTEGER,
+    cell_id      INTEGER,
+    tech         TEXT,
+    risk         INTEGER,
+    reasons      TEXT,
+    rssi         INTEGER,
+    detail       TEXT         -- JSON for forensic replay
+);
+CREATE INDEX IF NOT EXISTS ix_cell_alerts_ts ON cell_alerts(ts);
 """
 
 
