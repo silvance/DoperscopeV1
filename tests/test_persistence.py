@@ -29,6 +29,17 @@ class _FakeScanner:
         return list(self._probes)
 
 
+class _FakeSDR:
+    """Minimal SDR scanner stub for stage-3 cell-alert tests."""
+    def __init__(self):
+        self.error_count = 0
+        self.last_packet_ts = 0.0
+        self._cells = []
+
+    def get_cells(self):
+        return list(self._cells)
+
+
 def _make_persistence(env=None):
     """Spin up a Persistence pointed at a fresh tempdir, return
     (Persistence instance, tempdir, db_path). Caller must clean up."""
@@ -44,7 +55,7 @@ def _make_persistence(env=None):
         if m.startswith("persistence"):
             del sys.modules[m]
     from persistence import Persistence
-    p = Persistence(_FakeScanner(), _FakeScanner(), db_path=db_path)
+    p = Persistence(_FakeScanner(), _FakeScanner(), _FakeSDR(), db_path=db_path)
     return p, tmpdir, db_path
 
 
@@ -271,6 +282,67 @@ class PersistenceBLEAlertTests(unittest.TestCase):
             self.assertEqual(len(ble_alerts), 1, "expected exactly 1 BLE alert (the iPhone)")
             self.assertEqual(ble_alerts[0]["dev_type"], "iPhone")
             self.assertEqual(ble_alerts[0]["mac"], "11:22:33:44:55:66")
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+class PersistenceCellAlertTests(unittest.TestCase):
+    """Stage 3 added cell-alert routing — high-risk cells from the SDR
+    scanner should write a cell_alerts row, dedupe per session, and show
+    up in the unified Log tab feed."""
+
+    def test_high_risk_cell_fires_alert_once(self):
+        from persistence import SCHEMA
+        p, tmpdir, db_path = _make_persistence({"DOPESCOPE_RETENTION_DAYS": "0"})
+        try:
+            now = time.time()
+            rogue = {
+                "tech": "GSM", "mcc": 1, "mnc": 999, "cell_id": 42,
+                "rssi": -45, "rssi_max": -45, "hits": 1,
+                "risk": 95, "reasons": ["non_us_mcc:1", "strong_brief_unknown"],
+                "first_seen": now, "last_seen": now,
+            }
+            p._sdr._cells = [rogue]
+            os.makedirs(tmpdir, mode=0o700, exist_ok=True)
+            conn = sqlite3.connect(db_path)
+            conn.executescript(SCHEMA); conn.commit()
+            # First snapshot → alert fires.
+            p._snapshot(conn)
+            # Second snapshot with the same cell → dedup, no new alert.
+            p._snapshot(conn)
+            conn.close()
+
+            alerts = p.get_recent_alerts()
+            cell_alerts = [a for a in alerts if a["kind"] == "cell"]
+            self.assertEqual(len(cell_alerts), 1,
+                             "expected exactly 1 cell alert (deduped on second snapshot)")
+            self.assertIn("cell:GSM-1-999-42", cell_alerts[0]["fingerprint"])
+            # reasons land in the ssid field for Log-tab rendering
+            self.assertIn("non_us_mcc:1", cell_alerts[0]["ssid"])
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_low_risk_cell_stays_quiet(self):
+        from persistence import SCHEMA
+        p, tmpdir, db_path = _make_persistence({"DOPESCOPE_RETENTION_DAYS": "0"})
+        try:
+            now = time.time()
+            # Verizon LTE, no flags raised by the heuristics.
+            benign = {
+                "tech": "LTE", "mcc": 311, "mnc": 480, "cell_id": 100200300,
+                "rssi": -85, "rssi_max": -85, "hits": 12,
+                "risk": 0, "reasons": [],
+                "first_seen": now, "last_seen": now,
+            }
+            p._sdr._cells = [benign]
+            os.makedirs(tmpdir, mode=0o700, exist_ok=True)
+            conn = sqlite3.connect(db_path)
+            conn.executescript(SCHEMA); conn.commit()
+            p._snapshot(conn)
+            conn.close()
+
+            cell_alerts = [a for a in p.get_recent_alerts() if a["kind"] == "cell"]
+            self.assertEqual(cell_alerts, [], "low-risk cell should not alert")
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
 

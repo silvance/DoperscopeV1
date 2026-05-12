@@ -27,6 +27,7 @@ from wifi_scanner import WiFiScanner
 from ble_scanner import BLEScanner
 from zigbee_scanner import ZigbeeScanner
 from sdr_scanner import SDRScanner
+from cell_analyzer import load_opencellid_baseline
 from persistence import Persistence, _TRIVIAL_BLE_FP
 
 # ── Colors ───────────────────────────────────────────────
@@ -190,6 +191,16 @@ class Doperscope:
         self.ble_frozen = False
         self.ble_frozen_list = []
         self._bind_buttons()
+        # Load the OpenCellID baseline before starting the SDR thread so
+        # the very first observation gets scored against it. Path is
+        # configurable via DOPESCOPE_OCID_PATH; the default sits next to
+        # the DB in ~/.doperscope/opencellid/ocid_us.csv where
+        # setup_sdr.sh provisioned the directory.
+        ocid_path = os.environ.get(
+            "DOPESCOPE_OCID_PATH",
+            os.path.expanduser("~/.doperscope/opencellid/ocid_us.csv"),
+        )
+        self.sdr.set_baseline(load_opencellid_baseline(ocid_path))
         self.scanner.start()
         self.ble.start()
         self.zigbee.start()
@@ -1634,7 +1645,7 @@ class Doperscope:
             )
             self.screen.blit(
                 self.font_small.render(
-                    "Alerts land here when a phone or watchlist SSID is first seen.",
+                    "Alerts land here on phone / watchlist / rogue-cell events.",
                     True, (90, 90, 110)
                 ),
                 (60, 274)
@@ -1663,6 +1674,8 @@ class Doperscope:
                 tag, stripe = "[PHONE] ", RED
             elif kind == "ble":
                 tag, stripe = "[BLE] ", CYAN
+            elif kind == "cell":
+                tag, stripe = "[ROGUE CELL] ", RED
             else:
                 tag, stripe = "", GREY
 
@@ -1676,9 +1689,16 @@ class Doperscope:
             ssid   = a.get("ssid") or ""
             rssi   = a.get("rssi", -100)
 
+            # Cell alerts don't have a MAC; the fingerprint is the unique
+            # identifier the operator cares about ("cell:LTE-310-260-1234").
+            if kind == "cell":
+                primary = a.get("fingerprint") or "?"
+                header  = f"{ts_str}  {tag}{primary}"
+            else:
+                header  = f"{ts_str}  {tag}{os_}  {mac}"
             self.screen.blit(
                 self.font_small.render(
-                    f"{ts_str}  {tag}{os_}  {mac}",
+                    header,
                     True, WHITE if is_sel else GREY
                 ),
                 (12, y + 4)
@@ -1913,9 +1933,18 @@ class Doperscope:
             self.alert_until = time.time() + ALERT_FLASH_S
             mac = alert.get("mac") or "?"
             os_ = alert.get("os")  or "?"
-            if alert.get("kind") == "watchlist":
+            kind = alert.get("kind")
+            if kind == "watchlist":
                 ssid = alert.get("ssid") or "?"
                 self.alert_text = f"WATCHLIST HIT  '{ssid}'  {mac}"
+            elif kind == "cell":
+                # Cell alerts use the dev_type field for "Cell:LTE risk:N"
+                # and ssid for the comma-joined reasons. Surface the
+                # fingerprint so the operator can cross-ref the Cell tab.
+                fp = alert.get("fingerprint") or "?"
+                reasons = alert.get("ssid") or ""
+                short = reasons.split(",")[0] if reasons else "rogue"
+                self.alert_text = f"ROGUE CELL  {fp}  ({short})"
             else:
                 self.alert_text = f"PHONE DETECTED  {os_}  {mac}"
             if self.tick_sound:

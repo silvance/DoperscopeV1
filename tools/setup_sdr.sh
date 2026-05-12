@@ -88,11 +88,13 @@ else
 fi
 
 echo "==> 4/4: OpenCellID snapshot directory"
-# Stage 3 will look for the legitimacy baseline here. The snapshot
-# itself is operator-supplied — opencellid.org distributes a free
-# global CSV (filter to MCC=310/311/312 etc for the US) that should
-# go in this directory as ocid_us.csv. Not auto-downloaded because
-# OCID requires registration for the API key.
+# Stage 3 uses this as the legitimacy baseline for rogue-cell scoring.
+# The snapshot itself is operator-supplied — opencellid.org distributes
+# a free global CSV (https://opencellid.org/downloads.php — requires
+# registration for an API key). Filter to US MCCs (310/311/312/313) and
+# drop the result at ocid_us.csv in this directory. Without it the
+# heuristics still run (MCC plausibility, 2G-in-LTE downgrade) but they
+# can't catch a legitimate-looking but unknown cell ID.
 DATA_DIR="$(getent passwd "$REAL_USER" | cut -d: -f6)/.doperscope"
 install -o "$REAL_USER" -g "$REAL_USER" -m 0700 -d "$DATA_DIR/opencellid"
 
