@@ -128,7 +128,7 @@ class Doperscope:
         self.zigbee      = ZigbeeScanner()
         self.sdr         = SDRScanner()
         self.inp         = InputHandler()
-        self.persistence = Persistence(self.scanner, self.ble)
+        self.persistence = Persistence(self.scanner, self.ble, self.sdr)
 
         # Phone-alert UI state: when a new phone fingerprint shows up the
         # banner stays red for ALERT_FLASH_S so it's visible during a sweep.
@@ -1340,10 +1340,12 @@ class Doperscope:
 
     def _draw_cell_list(self):
         sstatus = self.sdr.status()
-        cells   = self.sdr.get_cells() if sstatus == "present" else []
+        cells   = self.sdr.get_cells() if sstatus != "absent" else []
 
-        if sstatus == "present":
-            label = "FW OK / NO CAPTURE"
+        if sstatus == "scanning":
+            label = "SCANNING"
+        elif sstatus == "present":
+            label = "NO CAPTURE"
         else:
             label = "NO SDR"
         self._draw_topbar(right_text=f"{label}  {len(cells)}c")
@@ -1360,11 +1362,10 @@ class Doperscope:
                 "Mission: rogue base station detection in non-SCIF spaces",
                 "  - LTE cell discovery via srsRAN cell_search + SIB1 decode",
                 "  - 2G cell enum via grgsm_scanner (catches downgrade attacks)",
-                "  - OpenCellID US snapshot as the legitimacy baseline",
+                "  - OpenCellID US snapshot as the legitimacy baseline (stage 3)",
                 "",
                 "Once the dongle is in, run tools/setup_sdr.sh to install",
-                "srsRAN + gr-gsm + RTL-SDR udev rules. Stage 2 wires the",
-                "capture loop; stage 3 layers the rogue-detection heuristics.",
+                "srsRAN + gr-gsm + RTL-SDR udev rules.",
             ]
             y = 90
             for line in lines:
@@ -1373,15 +1374,28 @@ class Doperscope:
             self._draw_footer("Y:Tab")
             return
 
-        # sstatus == "present"
-        pygame.draw.rect(self.screen, (50, 30, 0), (0, 44, 640, 22))
-        self.screen.blit(
-            self.font_small.render(
-                "RTL-SDR detected. Doperscope's cell-decode integration is NOT yet active.",
-                True, LOCKED_COL
-            ),
-            (8, 48)
-        )
+        if sstatus == "present":
+            # RTL-SDR plugged in but the capture loop never produced a
+            # cell — most likely because grgsm_scanner / cell_search
+            # aren't on PATH yet.
+            pygame.draw.rect(self.screen, (50, 30, 0), (0, 44, 640, 22))
+            self.screen.blit(
+                self.font_small.render(
+                    "RTL-SDR detected. Capture binaries missing or no cells yet — run tools/setup_sdr.sh.",
+                    True, LOCKED_COL
+                ),
+                (8, 48)
+            )
+        else:
+            # scanning
+            pygame.draw.rect(self.screen, (0, 30, 10), (0, 44, 640, 22))
+            self.screen.blit(
+                self.font_small.render(
+                    "Cycling US LTE + GSM bands. Risk scoring (stage 3) not yet active.",
+                    True, GREEN
+                ),
+                (8, 48)
+            )
 
         if not cells:
             self.screen.blit(
@@ -1390,10 +1404,10 @@ class Doperscope:
             )
             self.screen.blit(
                 self.font_small.render(
-                    "Stage 2 will wire srsRAN + grgsm_scanner into _run_loop.",
+                    "Band cycle takes ~2 minutes per pass.",
                     True, (90, 90, 110)
                 ),
-                (90, 274)
+                (170, 274)
             )
         else:
             ROW_H   = 70
