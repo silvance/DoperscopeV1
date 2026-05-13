@@ -29,6 +29,13 @@ REAL_USER="${SUDO_USER:-${USER}}"
 echo "==> 1/4: apt packages"
 # Most of the runtime dependencies for the cell-capture path. srsRAN
 # itself is built from source below.
+#
+# SoapySDR is the critical-but-easy-to-miss piece: without
+# libsoapysdr-dev + soapysdr-module-rtlsdr present at srsRAN build
+# time, cmake silently configures the build with NO RF support and
+# the resulting cell_search binary can only read IQ from a file —
+# it can't open the RTL-SDR at runtime. The "Compiling pdsch_ue with
+# no RF support" pragma in the build output is the smoking gun.
 apt-get update
 apt-get install -y --no-install-recommends \
     build-essential cmake git pkg-config \
@@ -36,6 +43,7 @@ apt-get install -y --no-install-recommends \
     libconfig++-dev libsctp-dev \
     libusb-1.0-0-dev \
     rtl-sdr librtlsdr-dev \
+    libsoapysdr-dev soapysdr-module-rtlsdr soapysdr-tools \
     gr-gsm \
     python3-pip
 
@@ -70,7 +78,18 @@ else
     git clone --depth=1 https://github.com/srsran/srsRAN_4G.git
     cd srsRAN_4G
     mkdir -p build && cd build
-    cmake -DCMAKE_BUILD_TYPE=RelWithDebInfo ..
+    cmake -DCMAKE_BUILD_TYPE=RelWithDebInfo .. 2>&1 | tee cmake.log
+    # Fail fast if cmake couldn't find an RF backend. Without this the
+    # build still succeeds but cell_search ends up unable to open any
+    # radio at runtime — operator-hostile to discover after a 45-minute
+    # build. Soapy is the path we install above; UHD is acceptable too.
+    if grep -qiE "RF_FOUND=FALSE|no.*rf.*support" cmake.log && \
+       ! grep -qiE "(soapy|uhd).*found" cmake.log; then
+        echo "ERROR: srsRAN cmake did not find SoapySDR or UHD." >&2
+        echo "       cell_search will build but won't open the RTL-SDR." >&2
+        echo "       Install libsoapysdr-dev + soapysdr-module-rtlsdr and re-run." >&2
+        exit 1
+    fi
     # Pi 4B has 4 cores; -j4 keeps the build under an hour without OOM.
     make -j4
     make install
@@ -107,10 +126,11 @@ SDR setup complete. REBOOT now so:
   - $REAL_USER picks up the plugdev group membership
 
 After reboot, smoke-test:
-  lsusb | grep -i realtek        # should show 0bda:2838 (or :2832)
-  rtl_test -t                    # should report 'Found 1 device(s)'
-  grgsm_scanner --help           # 2G enumeration binary
-  cell_search -h                 # LTE cell-search example binary
+  lsusb | grep -i realtek                       # 0bda:2838 (or :2832)
+  rtl_test -t                                    # 'Found 1 device(s)'
+  SoapySDRUtil --probe="driver=rtlsdr"          # Soapy <-> RTL-SDR bridge
+  grgsm_scanner --help                           # 2G enumeration binary
+  cell_search -h                                 # LTE cell-search binary
 
 Then drop an OpenCellID US snapshot at (used by stage 3):
   $DATA_DIR/opencellid/ocid_us.csv
