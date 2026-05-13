@@ -47,6 +47,52 @@ apt-get install -y --no-install-recommends \
     gr-gsm \
     python3-pip
 
+# gr-gsm in Debian 13 ships against a newer gr-osmosdr that broke two
+# things in /usr/lib/python3/dist-packages/gnuradio/gsm/device.py:
+#
+#   1. match() assumed `dev` was a dict; in the new bindings it's a
+#      SWIG-wrapped osmosdr.device_t — `k not in dev` and `dev[k]`
+#      both raise TypeError.
+#   2. exclude() passes the whole filters tuple to match() in one
+#      call; match() then tries .items() on a tuple and dies.
+#
+# Without these patches, even `grgsm_scanner -l` crashes with a
+# traceback after detecting the dongle. Both patches are idempotent.
+GRGSM_DEVICE_PY="/usr/lib/python3/dist-packages/gnuradio/gsm/device.py"
+if [ -f "$GRGSM_DEVICE_PY" ]; then
+    echo "    patching gr-gsm device.py for new gr-osmosdr bindings"
+    python3 <<EOF
+path = "$GRGSM_DEVICE_PY"
+src = open(path).read()
+
+# Patch 1: match() — coerce dev to string and substring-match.
+old_match_body = "    for k, v in filt.items():\n        if (k not in dev or dev[k] != v):\n            return False\n    return True"
+new_match_body = "    # Doperscope-patched for newer gr-osmosdr: device_t is a SWIG\n    # object, not a dict — stringify and substring-match instead.\n    dev_str = str(dev)\n    for k, v in filt.items():\n        if f\"{k}={v}\" not in dev_str:\n            return False\n    return True"
+if old_match_body in src:
+    src = src.replace(old_match_body, new_match_body)
+    print("      match() patched")
+elif "Doperscope-patched" in src:
+    print("      match() already patched, skipping")
+else:
+    print("      WARN: match() body not found verbatim — gr-gsm version may differ")
+
+# Patch 2: exclude() — iterate filters tuple instead of passing whole.
+old_exclude = "return [dev for dev in devices if not match(dev, filters)]"
+new_exclude = "return [dev for dev in devices if not any(match(dev, f) for f in filters)]"
+if old_exclude in src:
+    src = src.replace(old_exclude, new_exclude)
+    print("      exclude() patched")
+elif new_exclude in src:
+    print("      exclude() already patched, skipping")
+else:
+    print("      WARN: exclude() body not found verbatim")
+
+open(path, "w").write(src)
+EOF
+else
+    echo "    WARN: $GRGSM_DEVICE_PY not found — skipping gr-gsm compatibility patches"
+fi
+
 # RTL-SDR udev rules so the operator user can open the device without root.
 echo "==> 2/4: udev rules + dialout group"
 cat >/etc/udev/rules.d/20-rtlsdr.rules <<'EOF'
